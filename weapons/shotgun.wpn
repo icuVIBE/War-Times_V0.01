@@ -1,0 +1,38 @@
+# War Times Weapon Preset
+# Shotgun
+
+fire_rate = 0.8
+damage = 15
+range = 40
+max_ammo = 6
+reserve_ammo = 24
+reload_time = 2.5
+recoil_pitch = 5
+recoil_yaw = 0.8
+recoil_recovery = 4
+spread = 4
+ads_spread_mult = 0.6
+pellets_per_shot = 8
+automatic = 0
+
+gun_model = Guns/Shotgun_I
+gun_texture = 
+model_scale = 0.5
+model_offset = -0.12 0.06 -0.15
+model_rotation = 0 -90 0
+arm_offset = -0.12 0.06 -0.15
+
+right_grip = 0 -0.04 -0.04
+right_grip_rot = 0 0 0
+left_grip = 0 -0.02 0.18
+left_grip_rot = 0 0 0
+elbow_pole = 0 -0.3 0
+
+flash_duration = 0.07
+flash_muzzle_offset = 0
+flash_layer_count = 5
+flash_layer_0 = 0.04 0.04 0.04 0 0 0 0 1 1 0.9 1 0.4
+flash_layer_1 = 0.03 0.03 0.12 0.04 0 0 0 1 0.75 0.2 0.8 0.9
+flash_layer_2 = 0.07 0.02 0.025 0 0 0 0 1 0.6 0.1 1.2 0.6
+flash_layer_3 = 0.02 0.06 0.025 0 0 0 0 1 0.6 0.1 1.2 0.6
+flash_layer_4 = 0.015 0.015 0.02 0.02 0.015 0.01 25 1 0.5 0.05 2 1.5

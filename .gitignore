@@ -1,0 +1,17 @@
+# Build output
+build/
+
+# Visual Studio
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+.vs/
+
+# OS files
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# ImGui config (regenerated at runtime)
+imgui.ini

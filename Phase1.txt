@@ -1,0 +1,886 @@
+**CONFIDENTIAL**
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+# ICUX ENGINE
+
+Core Runtime Architecture
+
+Technical Design Document — Phase 1
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Version 0.0.0.0
+
+Classification: Internal — Engineering Eyes Only
+
+March 2026
+
+Prepared by: Engine Architecture Team
+
+Approved by: Technical Director / CTO
+
+# Revision History
+
+| **Version** | **Date**   | **Author**               | **Description**                       |
+|-------------|------------|--------------------------|---------------------------------------|
+| 0.0.0.0     | 2026-03-20 | Engine Architecture Team | Initial Phase 1 architecture document |
+| 0.0.0.0     | 2026-03-01 | Principal Architect      | Internal review draft                 |
+| 0.0.0.0     | 2026-02-01 | Engine Architecture Team | Technology stack evaluation complete  |
+| 0.0.0.0     | 2026-01-10 | Principal Architect      | Initial scope and design philosophy   |
+
+# Table of Contents
+
+# 1. Executive Summary
+
+This document defines the core runtime architecture for ICUX Engine, an in-house AAA game engine purpose-built for a first-person multiplayer shooter franchise. ICUX Engine is the centrepiece technology investment of a £250 million production programme targeting 120 FPS gameplay across Windows and Linux desktop platforms.
+
+Phase 1 covers the foundational runtime systems required to reach a playable networked multiplayer prototype. This includes the rendering pipeline (Vulkan primary, OpenGL 4.6 fallback), the Entity Component System, physics integration, authoritative multiplayer networking, asset management, and all supporting infrastructure: memory management, multithreading, serialisation, and profiling.
+
+The engine is designed for a team scaling to 250+ engineers. Every architectural decision in this document prioritises modular isolation, cache-friendly data layouts, deterministic frame behaviour, and build-system-enforced dependency rules to keep the codebase navigable at scale.
+
+## 1.1 Scope Boundaries
+
+**In scope (Phase 1):** Core engine loop, platform abstraction (Windows/Linux), Vulkan and OpenGL rendering backends, render graph, ECS, input, camera, physics (Jolt), networking (client-server authoritative), asset management, serialisation, memory management, multithreading/job system, profiling tools, build system, CI pipeline, and baseline gameplay systems (player controller, weapons, health).
+
+**Out of scope (Phase 2+):** Animation system, audio system, UI/HUD framework, anti-cheat, cinematic tools, visual scripting, modding pipeline, console platform ports, ray tracing, and advanced rendering features (nanite-style virtualised geometry, global illumination).
+
+# 2. Technology Stack
+
+| **Domain**             | **Technology**                                                       | **Rationale**                                                                                                                                                                                |
+|------------------------|----------------------------------------------------------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| Language               | C++20 (ISO 14882:2020)                                               | Concepts for type-safe APIs; constexpr for compile-time reflection; coroutines reserved for async I/O. Modules evaluated but deferred until compiler support stabilises across MSVC and GCC. |
+| Primary Rendering API  | Vulkan 1.3                                                           | Explicit GPU control, multi-threaded command buffer recording, compute-shader-driven pipelines. First-class Linux support. Industry standard for high-performance titles.                    |
+| Fallback Rendering API | OpenGL 4.6 (Core Profile)                                            | Broader driver compatibility for development hardware, QA rigs, and legacy GPU validation. DSA (Direct State Access) and SPIR-V ingestion via GL_ARB_gl_spirv for shader parity.             |
+| Physics                | Jolt Physics 5.x                                                     | MIT-licensed, SIMD-optimised, deterministic option, active development. Superior multi-threaded broad-phase vs Bullet. Proven in Horizon Forbidden West.                                     |
+| Build System           | CMake 3.28+                                                          | Module-level targets, precompiled header support, first-class Vulkan SDK integration, cross-platform generation (MSVC, GCC, Clang).                                                          |
+| Compilers              | MSVC 17.x (primary), GCC 14+ (Linux), Clang 18+ (sanitiser/analysis) | MSVC for Windows production. GCC for Linux production. Clang for ASAN/UBSAN/TSAN CI builds and static analysis.                                                                              |
+| Maths Library          | glm 1.0+                                                             | Header-only, GLSL-compatible API, SIMD via GLM_FORCE_DEFAULT_ALIGNED_GENTYPES.                                                                                                               |
+| Windowing              | GLFW 3.4                                                             | Cross-platform (Win32/X11/Wayland), Vulkan surface creation, raw input support.                                                                                                              |
+| Vulkan Loader          | volk                                                                 | Meta-loader eliminates link-time Vulkan dependency; runtime function pointer resolution.                                                                                                     |
+| GPU Memory             | VMA (Vulkan Memory Allocator)                                        | Industry-standard sub-allocation, defragmentation, budget queries. Not reinvented internally.                                                                                                |
+| Networking Transport   | GameNetworkingSockets (Valve)                                        | Reliable-UDP, connection-oriented, encrypted, NAT punch-through, mature and battle-tested in Source 2.                                                                                       |
+| Testing                | Catch2 v3                                                            | Header-only, BDD-style, micro-benchmarking support. Low integration friction.                                                                                                                |
+| Shader Compilation     | glslangValidator / shaderc                                           | Offline GLSL to SPIR-V compilation. Same SPIR-V binaries consumed by both Vulkan and OpenGL 4.6 backends.                                                                                    |
+
+# 3. Design Philosophy
+
+## 3.1 Modular Isolation
+
+Every engine system is a discrete CMake target (e.g., ICUX::Core, ICUX::Renderer, ICUX::ECS). Modules declare public API headers in an Include/ directory; internal headers are unreachable by other modules at the build-system level. Circular dependencies are a build error. This enables 250+ engineers to work across systems without hidden coupling. Systems communicate through well-defined interfaces, typed message buses, and frame-synchronised data handoff — never through direct object references across module boundaries.
+
+## 3.2 Data-Oriented Design
+
+Hot-path data is laid out for cache efficiency. The ECS uses archetype-based storage (Structure-of-Arrays within each archetype) so that system iteration is a sequential memory scan. Deep OOP inheritance hierarchies are forbidden in per-entity and per-frame code paths. Object-oriented patterns are acceptable — and encouraged — at the system-level API boundary (e.g., the IRenderer interface, the IPhysicsWorld wrapper) where virtual dispatch cost is amortised over the entire frame.
+
+## 3.3 Multithreaded Scalability
+
+The engine scales across all available CPU cores via a lock-free work-stealing job system. The frame is divided into explicit phases with barrier sync points between them. There is no ad-hoc mutex locking in gameplay code. Cross-system data sharing uses double-buffering (read last frame, write this frame) to eliminate contention. Vulkan command buffer recording is parallelised across worker threads; OpenGL submission remains single-threaded by specification but is fed from a pre-built command list.
+
+## 3.4 Determinism Policy
+
+Full floating-point determinism across platforms (Windows vs Linux, MSVC vs GCC) is not targeted. The cost of strict IEEE-754 compliance and disabled FMA is prohibitive at 120 FPS with 64 players. Instead, the networking model uses server-authoritative state with client prediction and reconciliation. Replay systems, if added in Phase 2, will use recorded state snapshots rather than input replay. Physics determinism within a single platform and compiler is supported via Jolt’s deterministic mode for LAN competitive scenarios.
+
+## 3.5 Dual Rendering Backend Strategy
+
+Vulkan is the primary, production-grade rendering path — all new rendering features target Vulkan first. OpenGL 4.6 Core Profile is maintained as a compatibility backend for development convenience, QA hardware diversity, and as a fallback on Linux systems with incomplete Vulkan drivers. Both backends consume the same SPIR-V shader binaries, use the same material and mesh data formats, and implement the same render graph interface (IRenderBackend). The OpenGL backend is not expected to achieve feature or performance parity with Vulkan; it is a functional subset sufficient for gameplay development and testing.
+
+# 4. Platform Abstraction Layer
+
+The Platform Abstraction Layer (PAL) is the lowest module in the dependency graph. Every other engine system depends on PAL; PAL depends on nothing except the C++ standard library and OS APIs. PAL’s purpose is to present a single, platform-agnostic interface for window management, input, file I/O, timers, threading primitives, and graphics API initialisation.
+
+## 4.1 Supported Platforms
+
+| **Platform**                               | **Window System**        | **Graphics Init**       | **Compiler**        | **Notes**                                                           |
+|--------------------------------------------|--------------------------|-------------------------|---------------------|---------------------------------------------------------------------|
+| Windows 10/11                              | Win32 (via GLFW)         | Vulkan 1.3 / OpenGL 4.6 | MSVC 17.x           | Primary development and shipping platform. Raw Input API for mouse. |
+| Linux (Ubuntu 22.04+, Fedora 39+, SteamOS) | X11 / Wayland (via GLFW) | Vulkan 1.3 / OpenGL 4.6 | GCC 14+ / Clang 18+ | Steam Deck and desktop Linux. Wayland preferred where available.    |
+
+## 4.2 Window and Surface Management
+
+GLFW handles window creation, event polling, and Vulkan/OpenGL surface creation on both platforms. The engine creates a single borderless or decorated window at startup. Resolution, display mode (windowed, borderless fullscreen, exclusive fullscreen), and V-Sync preference are read from the engine configuration file. On Vulkan, volk loads all instance and device function pointers at runtime — no link-time dependency on the Vulkan loader. On OpenGL, GLFW’s built-in loader or glad is used to resolve 4.6 Core Profile entry points.
+
+## 4.3 OS Abstraction
+
+- **File I/O:** Asynchronous file reads via platform-native APIs (ReadFileEx / io_uring on Linux). Synchronous fallback for small config files. All paths normalised to forward-slash internally.
+
+- **Timers:** High-resolution monotonic clock via QueryPerformanceCounter (Windows) and clock_gettime(CLOCK_MONOTONIC) (Linux). Resolution verified at startup; engines asserts sub-microsecond granularity.
+
+- **Threading:** Lightweight wrappers around std::thread, std::atomic, and platform futexes. Worker threads are pinned to physical cores. Thread naming via SetThreadDescription (Win32) / pthread_setname_np (Linux) for debugger visibility.
+
+- **Hardware Queries:** CPU core count (physical and logical), CPU feature flags (AVX2, SSE4.2), total system RAM, GPU device enumeration (Vulkan physical devices or OpenGL renderer string). Results cached at startup in a HardwareCapabilities struct.
+
+## 4.4 Input Subsystem
+
+Raw input is captured at the platform layer and delivered to the Input System as platform-independent events. On Windows, Raw Input API (WM_INPUT) is used for mouse delta to bypass pointer ballistics. On Linux, GLFW’s raw mouse motion mode is enabled (glfwSetInputMode with GLFW_RAW_MOUSE_MOTION). Keyboard state is polled per-frame via GLFW. Gamepad support is deferred to Phase 2 but the abstraction layer reserves the interface.
+
+## 4.5 Crash Handling
+
+Structured exception handling (Windows) and signal handlers (Linux SIGSEGV, SIGABRT) capture fatal errors. On crash, the engine writes a minidump (MiniDumpWriteDump on Windows, core dump configuration on Linux), flushes the async log buffer to disk, and exits cleanly. In development builds, a crash dialog displays the faulting address, call stack (via DbgHelp or libunwind), and the last 50 log lines.
+
+# 5. Core Engine System
+
+## 5.1 Engine Lifecycle
+
+Engine startup follows an explicit initialisation order graph. Each system declares its dependencies via a static descriptor (e.g., the Renderer depends on PAL and AssetManager). The Core module topologically sorts these descriptors and initialises systems in dependency order. Shutdown runs in reverse order. Circular dependencies are a fatal startup error.
+
+### 5.1.1 Startup Sequence
+
+- 1\. Load engine configuration (INI/TOML, immutable after parse)
+
+- 2\. Initialise logging subsystem (async file writer, severity channels)
+
+- 3\. Initialise memory subsystem (virtual memory reservation, allocator creation)
+
+- 4\. Initialise PAL (window, input, hardware queries)
+
+- 5\. Initialise graphics backend (Vulkan preferred; fallback to OpenGL if Vulkan unavailable or overridden by config)
+
+- 6\. Initialise profiling tools
+
+- 7\. Initialise asset manager (I/O threads, cache)
+
+- 8\. Initialise ECS world
+
+- 9\. Initialise physics world (Jolt)
+
+- 10\. Initialise networking subsystem
+
+- 11\. Initialise gameplay systems
+
+- 12\. Enter main loop
+
+## 5.2 Frame Loop Architecture
+
+The engine uses a fixed-timestep simulation with variable-timestep rendering. The simulation runs at a locked 64 Hz (15.625 ms per tick), matching the server tick rate. Rendering runs as fast as possible (target: 120 FPS / 8.33 ms) or V-Synced. The frame loop accumulates real elapsed time and runs zero or more simulation steps per render frame, with interpolation for smooth visual output between ticks.
+
+### 5.2.1 Frame Loop Pseudocode
+
+> accumulator = 0.0
+>
+> while (running) {
+>
+> dt = clock.elapsed() // real wall-clock delta
+>
+> accumulator += dt
+>
+> // ── Phase 1: Input Gather (main thread) ──
+>
+> platform.pollEvents()
+>
+> inputSystem.captureFrame()
+>
+> // ── Phase 2: Fixed-Step Simulation (parallel) ──
+>
+> while (accumulator \>= FIXED_DT) {
+>
+> networkSystem.receivePackets()
+>
+> gameplaySystems.update(FIXED_DT)
+>
+> physicsWorld.step(FIXED_DT)
+>
+> physicsWorld.syncToECS()
+>
+> networkSystem.sendState()
+>
+> accumulator -= FIXED_DT
+>
+> }
+>
+> // ── Phase 3: Render Preparation (parallel) ──
+>
+> alpha = accumulator / FIXED_DT
+>
+> sceneManager.interpolateTransforms(alpha)
+>
+> sceneManager.performCulling(camera)
+>
+> renderGraph.build(scene, camera)
+>
+> // ── Phase 4: GPU Submission (main thread) ──
+>
+> renderBackend.submit(renderGraph)
+>
+> renderBackend.present()
+>
+> }
+
+## 5.3 Configuration System
+
+Engine configuration is loaded from a TOML file at startup and stored as an immutable key-value store. Configuration is never modified at runtime — runtime tweaks use the developer console (debug builds only) and are not persisted. Configuration categories include: display (resolution, V-Sync, rendering backend selection), audio (deferred), networking (server address, tick rate), input (sensitivity, key bindings), and engine (memory budgets, thread counts, log levels).
+
+## 5.4 Logging and Error Reporting
+
+All log output is routed through a centralised async logger. Log calls specify a channel (Core, Renderer, Physics, Network, Gameplay, Assets, ECS) and a severity level (Verbose, Info, Warning, Error, Fatal). The logger writes to a ring buffer; a dedicated I/O thread flushes to disk. In development builds, logs also stream to stdout and the in-engine developer console. Fatal-severity logs trigger an immediate flush, stack trace capture, and controlled shutdown. Shipping builds strip Verbose-level calls at compile time via macro elimination.
+
+# 6. Rendering System
+
+The rendering system is the most complex module in ICUX Engine. It is designed around a render graph abstraction that is backend-agnostic, with concrete implementations for Vulkan 1.3 (primary) and OpenGL 4.6 Core Profile (fallback). Both backends consume the same SPIR-V shader binaries, the same PBR material definitions, and the same mesh data formats.
+
+## 6.1 Backend Abstraction (IRenderBackend)
+
+The rendering system defines an IRenderBackend interface that both Vulkan and OpenGL backends implement. This interface exposes operations at the render-graph level: begin frame, execute compiled render graph, present. Individual draw calls and state changes are never exposed across the module boundary. The backend is selected at startup based on hardware capabilities and configuration. Switching backends requires an engine restart.
+
+| **Capability**                   | **Vulkan Backend**                                               | **OpenGL Backend**                                                                                  |
+|----------------------------------|------------------------------------------------------------------|-----------------------------------------------------------------------------------------------------|
+| Multi-threaded command recording | Yes — parallel command buffer recording across worker threads    | No — single-threaded by specification. Command list pre-built on workers, submitted on main thread. |
+| Render graph resource barriers   | Automatic VkImageMemoryBarrier / VkBufferMemoryBarrier insertion | Emulated via glMemoryBarrier and explicit glFinish where required                                   |
+| Compute shaders                  | Full support (async compute queue)                               | Supported via GL compute shaders (no async queue)                                                   |
+| GPU-driven rendering             | Indirect draw + GPU culling compute pass                         | Indirect draw via glMultiDrawElementsIndirect (no GPU culling)                                      |
+| Shader format                    | SPIR-V (native)                                                  | SPIR-V via GL_ARB_gl_spirv (driver must support extension)                                          |
+| Memory management                | VMA sub-allocation                                               | Driver-managed (no manual sub-allocation)                                                           |
+| Dynamic resolution scaling       | Render to off-screen target, upscale blit                        | Render to FBO, upscale blit                                                                         |
+| Debug tooling                    | Vulkan Validation Layers, RenderDoc, GPU timestamps              | OpenGL debug output, RenderDoc, timer queries                                                       |
+
+## 6.2 Render Graph
+
+Frame rendering is expressed as a directed acyclic graph (DAG) of render passes. Each pass declares its input resources (textures, buffers), output resources (render targets, storage buffers), and pipeline state. The render graph compiler analyses resource lifetimes and dependencies to: insert memory barriers automatically (Vulkan) or synchronisation calls (OpenGL); allocate transient resources from a per-frame pool; cull passes whose outputs are not consumed by any subsequent pass; and reorder passes to maximise GPU parallelism without violating data dependencies.
+
+The render graph is rebuilt every frame. This is intentional — it allows dynamic pass insertion (e.g., debug visualisation passes) and conditional pass execution (e.g., skip shadow passes when no shadow-casting lights are visible) without branching inside render code.
+
+### 6.2.1 Standard Frame Graph (Clustered Forward Path)
+
+- Pass 0: GPU Culling (compute) — Reads scene BVH, camera frustum. Writes visible instance buffer and indirect draw commands.
+
+- Pass 1: Shadow Atlas Update — CSM cascades for directional light. Cubemap faces for up to 8 point lights. Spot light shadow maps.
+
+- Pass 2: Depth Pre-Pass — Writes depth buffer (reverse-Z). Enables early-Z rejection for the forward pass.
+
+- Pass 3: Light Clustering (compute) — Subdivides view frustum into 3D grid. Assigns lights to clusters based on bounding sphere overlap.
+
+- Pass 4: Forward Lighting Pass — PBR shading with clustered light lookup. Reads depth buffer, shadow maps, light cluster grid, IBL environment maps. Writes HDR colour target.
+
+- Pass 5: Skybox / Environment — Rendered at infinite depth after opaque geometry.
+
+- Pass 6: Transparent Pass — Sorted back-to-front. Additive/alpha blending.
+
+- Pass 7: Post-Processing Chain — SSAO, bloom (downsample/upsample), TAA or FXAA, motion blur, tone mapping (ACES filmic). Writes final LDR target.
+
+- Pass 8: UI Overlay (Phase 2) — Reserved pass slot.
+
+- Pass 9: Present — Blit to swapchain / window framebuffer.
+
+## 6.3 Vulkan Resource Management
+
+- **Descriptor Sets:** Cached and pooled. Descriptors are allocated from VkDescriptorPool instances sized per frame-in-flight. Descriptor set layouts are hashed by binding configuration; identical layouts share a single VkDescriptorSetLayout handle.
+
+- **Pipeline State Objects:** Hashed by (shader permutation key + vertex layout + render pass + blend state + depth state). Cached in a concurrent hash map. Pipeline creation is deferred to a background thread if the combination is encountered for the first time.
+
+- **Command Buffers:** Allocated per-thread from per-thread VkCommandPool instances (one pool per frame-in-flight per worker thread). Reset each frame. Secondary command buffers used for parallel recording of individual render passes.
+
+- **Synchronisation:** Frame pacing via double-buffered (or triple-buffered) in-flight frames. VkFence per frame-in-flight; VkSemaphore for swapchain image acquisition and queue submission ordering.
+
+## 6.4 Shader System
+
+Shaders are authored in GLSL and compiled offline to SPIR-V via glslangValidator (integrated into the asset build pipeline). The same SPIR-V binaries are consumed by both the Vulkan backend (natively) and the OpenGL backend (via GL_ARB_gl_spirv). Runtime shader variant selection uses permutation keys — a bitfield of feature flags (e.g., HAS_NORMAL_MAP \| SKINNED \| SHADOW_PASS) that index into a pre-compiled variant table. In development builds, a file watcher monitors .glsl source files and triggers SPIR-V recompilation and hot-reload on change.
+
+## 6.5 Material System
+
+Materials are data-driven PBR definitions stored as TOML files. Each material references a shader permutation key and a set of texture slots: albedo, normal, metallic, roughness, ambient occlusion, and emissive. Material instances can override individual parameters (e.g., tint colour, roughness scale) without duplicating the full definition. Materials are loaded by the asset system and resolved to GPU-resident descriptor sets at bind time.
+
+## 6.6 Lighting Pipeline
+
+ICUX Engine uses clustered forward rendering. The view frustum is subdivided into a 3D grid of clusters (typically 16×16 tiles × 24 depth slices). A compute pass assigns each active light to overlapping clusters. During the forward lighting pass, each fragment looks up its cluster and iterates only over lights assigned to that cluster. This approach efficiently supports hundreds of dynamic point and spot lights without the bandwidth overhead of a deferred G-buffer on the target 120 FPS budget.
+
+## 6.7 Shadow Mapping
+
+- **Directional Lights:** Cascaded Shadow Maps (CSM) with 4 cascades. Cascade split distances are logarithmic with a linear blend factor. Shadow maps rendered per frame; stabilised with texel-snapping to reduce shimmer. Resolution: 2048×2048 per cascade.
+
+- **Point Lights:** Dual-paraboloid or cubemap shadow maps. Resolution: 512×512 per face. Only the nearest 8 shadow-casting point lights are updated per frame; remaining lights use the last cached shadow map.
+
+- **Spot Lights:** Standard perspective projection shadow map. Resolution: 1024×1024.
+
+## 6.8 Post-Processing Pipeline
+
+The post-processing chain runs as a series of full-screen compute or fragment passes within the render graph. The chain is: SSAO (half-resolution, bilateral blur) → Bloom (13-tap Gaussian, 6-level mip chain) → Motion Blur (per-pixel velocity, variable sample count) → TAA (Halton jitter, neighbourhood clamping, 0.9 blend factor) or FXAA (as fallback) → Tone Mapping (ACES filmic) → Output. Each post-process pass is a render graph node and can be individually disabled via configuration.
+
+## 6.9 Dynamic Resolution Scaling
+
+When GPU frame time exceeds a configurable threshold (default: 7.5 ms, leaving headroom within the 8.33 ms budget), the engine reduces the internal render resolution by a scale factor (minimum: 65%). The final image is upscaled to the display resolution via a bilinear or Lanczos blit. Resolution is increased again when GPU headroom recovers. The scaling factor is smoothed over 8 frames to prevent oscillation.
+
+# 7. Entity Component System
+
+ICUX Engine’s ECS is a custom archetype-based implementation. It is the central authority for entity lifetime and component data. All gameplay and engine systems (rendering, physics, networking) consume ECS data; they do not own entities.
+
+## 7.1 Archetype Storage Model
+
+Entities with the same set of component types are grouped into an archetype. Each archetype stores components in contiguous, tightly-packed arrays (one array per component type within the archetype). This layout maximises cache utilisation during system iteration: a system querying (Transform, Velocity) performs a linear scan over two parallel arrays per matching archetype, with no pointer chasing and no wasted cache lines from unrelated component data.
+
+Adding or removing a component from an entity moves it to a different archetype. This is a structural change and is not free — it involves a memcpy of all component data to the new archetype’s arrays. To prevent mid-frame structural changes from invalidating active iterators, all structural mutations are deferred to command buffers.
+
+## 7.2 Entity Identifiers
+
+Entity IDs are 64-bit values: 32 bits for the index (slot in the entity array) and 32 bits for a generation counter. When an entity is destroyed, its slot is recycled but the generation counter is incremented. Any system holding a stale entity ID can detect invalidity by comparing the stored generation against the current generation for that slot. This eliminates dangling reference bugs without the overhead of reference counting or garbage collection.
+
+## 7.3 Component Design Rules
+
+- Components are plain data structs. No virtual functions, no heap allocations, no pointers to other components.
+
+- Components must be trivially copyable (memcpy-safe) for archetype migration and network serialisation.
+
+- Components are registered at compile time via a type-registration macro that generates a unique type ID and serialisation metadata.
+
+- Component size should ideally fit within a single cache line (64 bytes). Oversized components are permitted but flagged by the profiler.
+
+## 7.4 System Scheduling and Parallelism
+
+Each ECS system declares its component access: which component types it reads and which it writes. The system scheduler analyses these declarations and submits non-conflicting systems as parallel jobs to the job system. Two systems can run in parallel if their write sets do not overlap and neither writes to a component the other reads. Systems with overlapping access are serialised within the same phase. The programmer never writes explicit thread synchronisation code in gameplay systems.
+
+## 7.5 Command Buffers
+
+Structural changes (entity creation, entity destruction, component addition/removal) are not applied immediately. Instead, systems write commands to per-thread command buffers. At designated sync points between system groups (e.g., after all gameplay systems complete, before rendering systems begin), the main thread drains all command buffers and applies structural changes atomically. This guarantees that no system ever observes a partially-modified archetype.
+
+## 7.6 Queries
+
+Archetype queries (e.g., “all entities with Transform and MeshRenderer”) are evaluated once and cached. The cached query stores a list of matching archetypes. When a new archetype is created (because a novel component combination is encountered), all cached queries are checked for a match and updated if necessary. In practice, the archetype set stabilises early in a level’s lifetime, so query updates are rare after initial entity spawning.
+
+# 8. Scene Management
+
+## 8.1 Scene Graph and Spatial Hierarchy
+
+The scene graph maintains parent-child transform relationships. It reads TransformComponent data from the ECS, resolves world-space transforms by walking the hierarchy, and writes the results back to a WorldTransformComponent. The scene graph is one system consuming ECS data — it does not own entities. This separation means the ECS remains the single source of truth for entity lifetime, while the scene graph provides spatial queries and hierarchical transform resolution.
+
+## 8.2 Spatial Acceleration
+
+A bounding volume hierarchy (BVH) is maintained for all entities with spatial extent (mesh renderers, colliders, lights). The BVH supports frustum culling (used by the renderer), broad-phase overlap queries (used by physics interest management), and spatial interest queries (used by networking to determine which entities a client should receive updates for). The BVH is incrementally updated each frame: static objects are inserted once; dynamic objects are refitted in-place using their current AABB.
+
+## 8.3 Level Streaming
+
+The world is divided into rectangular cells. Each cell is an independently loadable unit containing entity definitions, static geometry, and per-cell asset references. A streaming manager maintains a priority queue of cells ranked by distance to the player and gameplay importance (e.g., cells containing objectives are prioritised). Cells are loaded asynchronously on I/O threads; once loaded, their entities are instantiated into the ECS and their geometry is uploaded to GPU memory. Cells outside the interest radius are unloaded, freeing CPU and GPU memory. The streaming system guarantees that no I/O operation blocks the gameplay or rendering threads; stalls greater than 2 ms are logged as errors.
+
+# 9. Physics System (Jolt Integration)
+
+Jolt Physics is integrated as third-party middleware behind a wrapper layer (ICUX::Physics). The wrapper translates between engine types (glm vectors, ECS entity IDs) and Jolt types (JPH::Vec3, JPH::BodyID). The physics world is owned by the physics system; it is not directly accessible from gameplay code. Gameplay systems interact with physics through query APIs (raycast, shape cast, overlap) and by writing to PhysicsRequestComponents that the physics system processes each tick.
+
+## 9.1 Simulation
+
+- **Timestep:** Fixed 15.625 ms (64 Hz), synchronised with the gameplay simulation tick and the server tick rate.
+
+- **Rigid Bodies:** Static (world geometry), dynamic (physics objects), and kinematic (player capsules, moving platforms).
+
+- **Collision Layers:** Player, Static, Dynamic, Projectile, Trigger. Layer interaction matrix configured at startup via the physics wrapper.
+
+- **Player Collision:** Capsule collider per player character. Height and radius configured per gameplay archetype.
+
+- **Gravity:** Default -9.81 m/s². Per-body override supported for gameplay mechanics (low-gravity zones).
+
+## 9.2 Queries
+
+- **Raycast:** Used for hitscan weapon traces, line-of-sight checks, and interaction probes. Results include hit point, normal, body ID (mapped to ECS entity), and material.
+
+- **Shape Cast:** Sphere and capsule sweeps for projectile collision and movement validation.
+
+- **Overlap:** AABB and sphere overlap queries for trigger volumes, area-of-effect abilities, and spatial interest.
+
+## 9.3 ECS Synchronisation
+
+After each physics step, the physics system reads Jolt’s body transforms and writes them back to TransformComponent on the corresponding ECS entities. This write happens at a sync point between the physics phase and the rendering phase, ensuring the renderer always sees a consistent snapshot. Gameplay systems that need to apply forces or set velocities write to a PhysicsInputComponent; the physics system reads these inputs at the start of the next physics step.
+
+# 10. Networking System
+
+ICUX Engine implements a client-server authoritative multiplayer model over reliable-UDP (GameNetworkingSockets). The server runs the canonical simulation at 64 Hz. Clients predict local player state for responsiveness and reconcile against server corrections. Remote entities are interpolated from buffered server snapshots. This is the same fundamental architecture used by Source Engine, Overwatch, and Valorant — proven at scale for competitive FPS games.
+
+## 10.1 Tick Model
+
+| **Parameter**          | **Value**                         | **Rationale**                                                                           |
+|------------------------|-----------------------------------|-----------------------------------------------------------------------------------------|
+| Server tick rate       | 64 Hz (15.625 ms)                 | Matches competitive FPS standard. Balanced between responsiveness and bandwidth.        |
+| Client simulation rate | 64 Hz (locked to server tick)     | Client prediction runs at the same rate as the server for deterministic reconciliation. |
+| Client render rate     | Unlocked (target 120 FPS)         | Rendering interpolates between simulation ticks for smooth visual output.               |
+| Snapshot send rate     | 64 Hz (full tick rate)            | Every server tick produces a snapshot. Delta compression keeps bandwidth manageable.    |
+| Input send rate        | 64 Hz (one input packet per tick) | Client sends input buffer (current + recent inputs for redundancy) each tick.           |
+| Interpolation delay    | 100 ms (6.4 ticks)                | Remote entities are rendered at server time minus 100 ms. Provides buffer for jitter.   |
+
+## 10.2 Client Prediction and Reconciliation
+
+The client simulates the local player’s movement immediately on input, without waiting for server confirmation. The input (tick number, movement direction, buttons pressed) is sent to the server and also stored in a local input history buffer. When the server’s authoritative state for a given tick arrives, the client compares its predicted position for that tick against the server’s position. If the discrepancy exceeds a threshold (default: 0.1 units), the client snaps to the server state and re-simulates all subsequent ticks from the corrected state using the buffered inputs. This produces a seamless experience under normal network conditions and corrects cheating or desynchronisation transparently.
+
+## 10.3 Entity Interpolation
+
+Remote (non-local) player entities and networked objects are not predicted. Instead, the client buffers the two most recent server snapshots for each remote entity and interpolates between them at render time. The interpolation delay (100 ms by default) ensures that the client always has two bounding snapshots available, even under moderate jitter. Position is linearly interpolated; rotation is spherically interpolated (slerp). Extrapolation is used as a last resort if a snapshot is late, but is capped at 200 ms to prevent visual artefacts.
+
+## 10.4 Lag Compensation
+
+When the server processes a hitscan weapon trace, it must account for the fact that the shooting client was aiming at a past version of the world (due to interpolation delay + network latency). The server estimates the client’s render timestamp for the firing tick and rewinds all player hitbox positions to that timestamp. The raycast is then performed against the rewound state. This ensures that if a player’s crosshair was on a target on their screen, the shot registers on the server. The rewind window is capped at 250 ms to limit abuse by high-latency players.
+
+## 10.5 Packet Serialisation and Bandwidth
+
+Network packets are bitpacked — each field is written with the minimum number of bits required for its range (e.g., a health value 0–100 is 7 bits, not 32). Schema versioning is attached to each packet type: the deserialiser handles missing or added fields gracefully for forward/backward compatibility during rolling updates. Delta compression between consecutive snapshots further reduces bandwidth. The target bandwidth budget is ≤40 KB/s per connected client on a 64-player server, yielding ≤2.5 MB/s total server upstream.
+
+## 10.6 Session Management
+
+Connection lifecycle: Discovery (lobby/matchmaking) → Connect (reliable handshake via GameNetworkingSockets) → Authenticate (token exchange with backend service) → Load (client downloads level metadata, streaming begins) → Play (full simulation) → Disconnect (graceful or timeout). Reconnection is supported within a configurable window (default: 60 seconds) by preserving the player’s entity and input buffer server-side.
+
+# 11. Asset Management System
+
+## 11.1 Handle System
+
+Gameplay and engine code never hold raw pointers to asset data. Instead, they hold lightweight asset handles: a 32-bit asset ID plus a 16-bit type tag and a 16-bit generation counter. The asset manager resolves handles to data pointers internally. Handles can be in one of four states: Unloaded, Loading, Loaded, or Failed. Systems must check handle state before use; accessing an Unloaded handle returns a default fallback (e.g., a pink checkerboard texture, a unit cube mesh).
+
+## 11.2 Asynchronous Loading
+
+Asset loading runs on dedicated I/O threads (2 by default, configurable). When a handle is first requested, the asset manager enqueues a load job that reads the file from disk, deserialises it, uploads GPU resources (textures, buffers), and transitions the handle to Loaded. Dependencies are loaded transitively: requesting a material triggers loads for its textures and shader variants. The gameplay thread is never blocked by I/O; systems poll handle state or register callbacks.
+
+## 11.3 Caching and Eviction
+
+Loaded assets are cached in memory with configurable budgets per asset type (e.g., 512 MB for textures, 256 MB for meshes). When the budget for a type is exceeded, the least-recently-used assets are evicted. Eviction is deferred until the asset is not referenced by any active entity (tracked via reference counts on handles). Pinned assets (e.g., player weapon models, UI atlases) are exempt from eviction.
+
+## 11.4 Hot Reload (Development Builds)
+
+A file system watcher monitors the asset source directories. When a file is modified (texture, shader source, material definition, config file), the asset manager reloads the asset, re-processes it through the build pipeline (e.g., recompiles GLSL to SPIR-V), and notifies all dependents. Hot-reload applies within 1–2 frames for textures and shaders. This pipeline is compiled out of shipping builds.
+
+## 11.5 Packaging (Shipping Builds)
+
+In shipping builds, assets are not loaded from loose files. Instead, an offline packaging tool packs all assets into archive files (.icux extension) with a flat index table for O(1) lookup by asset ID. Archives are optionally LZ4-compressed. The asset manager reads from archives at runtime with zero loose file access, improving load times and eliminating file system enumeration overhead.
+
+# 12. Serialisation Framework
+
+## 12.1 Binary Serialisation
+
+Used for network packets, asset packaging, and save data. Binary format is bitpacked, little-endian, and schema-versioned. Each serialisable type has a version number baked into the stream header. The deserialiser supports forward and backward compatibility: missing fields are filled with registered defaults; unknown fields are skipped. This allows rolling server updates without client downtime.
+
+## 12.2 Text Serialisation
+
+TOML is used for human-editable configuration and data files: engine config, material definitions, input bindings, level cell manifests. JSON is used for interchange with external tools (e.g., asset pipeline metadata). Text formats are parsed at startup or asset load time; they are never parsed during runtime hot paths.
+
+## 12.3 Reflection-Lite
+
+Serialisable types register their fields via a ICUX_REFLECT macro that generates a compile-time field descriptor table. This provides just enough reflection for serialisation (field name, type, offset, version-added) without the overhead of full RTTI. The macro expands to constexpr metadata that the serialisation framework consumes. No dynamic type queries are used at runtime.
+
+# 13. Multithreading Architecture
+
+## 13.1 Job System
+
+The job system is a lock-free work-stealing scheduler. Jobs are small, self-contained units of work (e.g., “cull 256 objects against frustum”, “update 1024 transforms”, “serialise 64 network packets”). Systems submit jobs to a global job queue; worker threads pop and execute them. Each worker thread has a local deque; when empty, it steals from other workers’ deques. Jobs can spawn child jobs and wait on job handles (futures) at explicit sync points.
+
+## 13.2 Worker Pool
+
+The worker pool consists of N-1 threads, where N is the number of physical CPU cores. The main thread is reserved for frame orchestration, Vulkan queue submission (or OpenGL context-bound submission), and platform event polling. Worker threads are pinned to physical cores and named for debugger visibility. In development builds, the profiler tracks per-thread job execution timelines.
+
+## 13.3 Frame Phases and Sync Points
+
+| **Phase**      | **Work**                                                                                                                                 | **Threading**                                              | **Sync**               |
+|----------------|------------------------------------------------------------------------------------------------------------------------------------------|------------------------------------------------------------|------------------------|
+| 1: Input       | Platform event poll, input capture, input buffering                                                                                      | Main thread only                                           | Barrier before Phase 2 |
+| 2: Simulation  | ECS gameplay systems, physics step, networking send/receive                                                                              | Parallel (job system)                                      | Barrier before Phase 3 |
+| 3: Render Prep | Transform interpolation, frustum culling, render graph build, light clustering                                                           | Parallel (job system)                                      | Barrier before Phase 4 |
+| 4: GPU Submit  | Vulkan command buffer recording (parallel secondaries), queue submit, present. OpenGL: single-thread submit from pre-built command list. | Main thread + workers (Vulkan) / Main thread only (OpenGL) | Frame complete         |
+
+## 13.4 Thread Safety Rules
+
+- No raw mutexes in gameplay code. If a system needs another system’s data, it reads last frame’s snapshot (one-frame latency for lock-free reads).
+
+- ECS structural changes (entity create/destroy) are deferred to command buffers, applied at sync points.
+
+- Asset loading uses a producer-consumer queue: I/O threads produce loaded data, the main thread consumes and finalises.
+
+- The Vulkan backend uses per-thread command pools and secondary command buffers. No command pool is shared across threads.
+
+- The OpenGL backend maintains a single GL context on the main thread. Workers build abstract command lists; the main thread translates and submits.
+
+# 14. Memory Management
+
+## 14.1 Allocator Hierarchy
+
+All memory allocation in ICUX Engine routes through a custom allocator API. The global C++ operator new is overridden in debug builds to assert if called directly — all allocations must go through named allocators for tracking and budgeting.
+
+| **Allocator**   | **Strategy**                    | **Use Cases**                                                           | **Lifetime**               |
+|-----------------|---------------------------------|-------------------------------------------------------------------------|----------------------------|
+| Linear (Frame)  | Bump pointer, reset each frame  | Per-frame scratch: command lists, visibility results, temporary strings | One frame                  |
+| Pool            | Fixed-size blocks, free list    | ECS archetype chunks, particle instances, small fixed-size objects      | Variable (chunk lifetime)  |
+| Stack           | LIFO push/pop                   | Scoped temporary data within a function or phase                        | Scoped (phase or function) |
+| General Purpose | TLSF (Two-Level Segregated Fit) | Long-lived variable-size: asset data, level geometry, large buffers     | Level or session lifetime  |
+
+## 14.2 GPU Memory
+
+Vulkan GPU memory is managed exclusively by VMA (Vulkan Memory Allocator). VMA handles sub-allocation, defragmentation, memory type selection (device-local, host-visible, etc.), and budget enforcement via VK_EXT_memory_budget. ICUX Engine does not implement custom GPU allocators. The OpenGL backend delegates memory management entirely to the driver, as OpenGL does not expose manual memory control.
+
+## 14.3 Memory Budgets
+
+Each system declares a memory budget at startup via its system descriptor. Budgets are enforced in development builds: exceeding a budget triggers a warning log and a profiler alert. Budgets are advisory in shipping builds (no runtime enforcement) to avoid crashes, but overages are flagged during QA profiling sessions.
+
+| **System**              | **Budget** | **Notes**                                           |
+|-------------------------|------------|-----------------------------------------------------|
+| ECS archetype storage   | 256 MB     | Scales with entity count. 64-player match peak.     |
+| Texture cache           | 512 MB     | LRU eviction above budget. Streaming textures.      |
+| Mesh cache              | 256 MB     | Includes vertex, index, and indirect draw buffers.  |
+| Physics (Jolt)          | 128 MB     | Broad-phase, narrow-phase, contact buffers.         |
+| Networking              | 64 MB      | Snapshot buffers, input history, replication state. |
+| Frame allocator         | 32 MB      | Reset each frame. Alerts if \>80% utilised.         |
+| Render graph transients | 128 MB     | Per-frame render targets, staging buffers.          |
+| Total engine runtime    | \<2 GB     | Excluding loaded asset data on disk/GPU.            |
+
+# 15. Input and Camera Systems
+
+## 15.1 Input System
+
+The input system receives raw platform events from PAL and translates them into gameplay actions via a configuration-driven binding table. Physical inputs (KEY_W, MOUSE_BUTTON_1, MOUSE_DELTA_X) are mapped to named actions (MoveForward, Fire, LookHorizontal). Actions have three states: Pressed (first frame), Held (subsequent frames), and Released. Analog values (mouse delta, trigger axis) are normalised to \[-1, 1\]. Input is captured once per frame in Phase 1 and buffered for the fixed-timestep simulation. If multiple simulation ticks run in a single render frame, each tick consumes the same input snapshot (the most recent).
+
+## 15.2 Camera System
+
+The first-person camera’s position is derived from the owning player entity’s TransformComponent plus an eye-height offset. Mouse look applies yaw rotation to the player entity (so the physics capsule turns) and pitch rotation to the camera only, clamped to ±89°. The view matrix is computed each frame from the camera’s world-space position and orientation. The projection matrix uses a configurable vertical FOV (default: 90°), the display aspect ratio, and reverse-Z depth (near=1000, far=0.01 mapped to \[0, 1\]) for superior depth precision at distance. Frustum planes are extracted from the combined view-projection matrix and passed to the culling system.
+
+# 16. Gameplay Systems
+
+Gameplay systems are ECS systems that operate on gameplay-specific components. They sit above the engine layer: they depend on engine systems (physics, networking, input) but engine systems never depend on gameplay. This strict one-way dependency ensures the engine remains reusable across projects.
+
+## 16.1 Player Controller
+
+Movement is driven by input actions (MoveForward, MoveRight, Jump, Crouch) applied to the player’s physics capsule via velocity impulses. Ground detection uses a short downward raycast. Air control is reduced to 30% of ground acceleration. Sprint, slide, and mantle mechanics are state-machine-driven with transition rules defined in data.
+
+## 16.2 Weapon System
+
+Weapons are data-driven definitions: fire rate, damage, spread, magazine size, reload time, projectile type (hitscan or physical). Hitscan weapons perform a physics raycast on the server (with lag compensation). Physical projectiles are spawned as networked entities with ballistic simulation. Ammo and reload state are replicated to the owning client.
+
+## 16.3 Health and Respawn
+
+Health is a replicated component with a \[0, max\] integer range. Damage events are authoritative: only the server modifies health. On death, the server triggers a respawn timer, selects a spawn point (weighted random with team-balancing and enemy-proximity checks), and re-instantiates the player entity. The client plays a death animation and spectate camera (Phase 2 visual polish).
+
+## 16.4 Gameplay Event Bus
+
+Gameplay events (OnPlayerKill, OnWeaponFire, OnObjectiveCapture, OnPlayerDamaged) are dispatched through a typed event bus. Systems subscribe to events they care about. Events are queued during simulation and dispatched at a sync point. This decouples gameplay logic from UI, audio, analytics, and networking hooks without direct cross-system references.
+
+# 17. Profiling and Debug Tools
+
+## 17.1 CPU Profiler
+
+A hierarchical timer system instruments code with ICUX_PROFILE_SCOPE("name") macros. Each scope records start and end timestamps to a per-thread ring buffer. The profiler aggregates scopes into a tree and displays per-frame timing as a flame graph in the developer console. In shipping builds, all profiling macros compile to no-ops (zero overhead).
+
+## 17.2 GPU Profiler
+
+Vulkan timestamp queries are inserted at the start and end of each render graph pass. Results are read back two frames later (to avoid stalls) and displayed alongside CPU timers. This reveals CPU/GPU sync bottlenecks and pass-level GPU cost. The OpenGL backend uses GL_ARB_timer_query for equivalent functionality.
+
+## 17.3 Memory Tracker
+
+Each allocator reports current usage, peak usage, allocation count, and budget utilisation. The memory tracker aggregates this data per-system and displays it in the developer console. In debug builds, every allocation is tagged with a source file and line number for leak detection.
+
+## 17.4 Network Debugger
+
+Real-time overlay graphs display: bandwidth in/out per client, packet loss percentage, round-trip time, prediction error magnitude, and interpolation buffer health. Artificial latency, jitter, and packet loss can be injected via console commands for testing. The network debugger is available in development builds only.
+
+## 17.5 Developer Console
+
+An in-engine console (opened via tilde key) allows runtime variable inspection and modification, command execution (e.g., “teleport”, “spawn_entity”, “net_simulate_loss 5”), and profiler/memory/network overlay toggles. Console commands are registered by systems via a simple macro. The console compiles out of shipping builds.
+
+# 18. Build System and CI
+
+## 18.1 CMake Module Structure
+
+Each engine system is a CMake target under the ICUX:: namespace (e.g., ICUX::Core, ICUX::Renderer, ICUX::ECS, ICUX::Physics). Targets declare public and private dependencies. The build system enforces that a module can only include headers from its declared dependencies. Attempting to include an undeclared module’s header produces a compilation error. Circular dependencies between modules are a build configuration error caught by CMake at generation time.
+
+### 18.1.1 Module Dependency Graph
+
+> ICUX::Gameplay → ICUX::Networking → ICUX::ECS → ICUX::Core
+>
+> → ICUX::Physics → ICUX::ECS
+>
+> → ICUX::Input → ICUX::Core
+>
+> ICUX::Renderer → ICUX::ECS → ICUX::Core
+>
+> → ICUX::Scene → ICUX::ECS
+>
+> → ICUX::Assets → ICUX::Core
+>
+> ICUX::Scene → ICUX::ECS → ICUX::Core
+>
+> ICUX::Assets → ICUX::Core
+>
+> ICUX::Physics → ICUX::ECS → ICUX::Core
+>
+> ICUX::Platform → ICUX::Core
+
+## 18.2 Build Configurations
+
+| **Configuration** | **Optimisation** | **Assertions** | **Profiling** | **Debug Symbols**       | **Use**                                 |
+|-------------------|------------------|----------------|---------------|-------------------------|-----------------------------------------|
+| Debug             | O0               | Enabled        | Full          | Full                    | Day-to-day development, debugging       |
+| Development       | O2               | Enabled        | Full          | Full                    | Profiling, QA testing, playtests        |
+| Release           | O2 + LTO         | Disabled       | Compiled out  | Stripped (PDB retained) | Shipping builds, performance benchmarks |
+
+## 18.3 Compile Time Optimisations
+
+- Precompiled headers for stable STL headers and glm to reduce translation unit parse time.
+
+- Unity builds (optional) concatenate source files per module for full rebuilds. Disabled for incremental development builds.
+
+- Forward declarations enforced in public API headers. Implementation headers use full includes.
+
+- C++20 modules evaluated but deferred: GCC and MSVC module support not yet stable enough for a 250-engineer codebase.
+
+## 18.4 CI Pipeline
+
+- Stage 1: Build — Debug and Release configurations on Windows (MSVC) and Linux (GCC, Clang).
+
+- Stage 2: Static Analysis — Clang-Tidy with custom ICUX rule set. Compiler warnings treated as errors (-Werror / /WX).
+
+- Stage 3: Unit Tests — Per-module Catch2 test suites.
+
+- Stage 4: Integration Tests — Multi-system tests (ECS + Physics, Networking + ECS, Renderer + Assets).
+
+- Stage 5: Sanitiser Builds — ASAN, UBSAN, TSAN on Clang/Linux. Failures block merge.
+
+- Stage 6: Network Tests — Automated client-server sessions with simulated latency (50–200 ms) and packet loss (1–5%).
+
+- Stage 7: Performance Regression — Key scenarios benchmarked. Regressions beyond threshold (\>5% frame time increase) block merge with notification.
+
+# 19. Performance Targets
+
+| **Metric**              | **Target**                                   | **Enforcement**                                          |
+|-------------------------|----------------------------------------------|----------------------------------------------------------|
+| Frame rate              | 120 FPS (8.33 ms frame budget)               | Dynamic resolution scaling triggers below 110 FPS        |
+| Server tick rate        | 64 Hz (15.625 ms per tick)                   | Server logs warning if tick exceeds 14 ms                |
+| Player count            | 64 players per match                         | Tested in CI with 64 simulated clients                   |
+| Client bandwidth        | ≤40 KB/s upstream per client                 | Network debugger alerts above threshold                  |
+| Server bandwidth        | ≤2.5 MB/s total upstream (64 clients)        | Monitored in production telemetry                        |
+| Asset streaming hitches | \<2 ms on gameplay thread                    | Profiler flags any I/O stall \>2 ms as error             |
+| Engine runtime memory   | \<2 GB system RAM (excl. assets)             | Memory tracker enforces per-system budgets in dev builds |
+| Level load time         | \<15 seconds (cold), \<5 seconds (streaming) | Measured per-level in CI                                 |
+| Input-to-photon latency | \<50 ms at 120 FPS                           | Measured via external latency analyser                   |
+
+# 20. Coding Standards
+
+## 20.1 Naming Conventions
+
+| **Element**                  | **Convention**         | **Example**                         |
+|------------------------------|------------------------|-------------------------------------|
+| Types (class, struct, enum)  | PascalCase             | TransformComponent, RenderGraph     |
+| Functions and methods        | camelCase              | updateTransform(), getEntityCount() |
+| Variables (local, parameter) | camelCase              | frameTime, entityCount              |
+| Member variables             | m\_ prefix + camelCase | m_position, m_isActive              |
+| Constants and macros         | UPPER_SNAKE_CASE       | MAX_ENTITIES, ICUX_PROFILE_SCOPE    |
+| Namespaces                   | PascalCase             | ICUX::Renderer, ICUX::ECS           |
+| File names                   | PascalCase             | RenderGraph.h, TransformSystem.cpp  |
+
+## 20.2 Header and Dependency Rules
+
+- Each module exposes a public API in Include/ICUX/\<Module\>/. Internal headers reside in Source/\<Module\>/ and are not includable by other modules.
+
+- Public headers use forward declarations wherever possible; full includes only in .cpp files.
+
+- No header includes another module’s internal headers. Enforced by CMake target include directories.
+
+- Include guards use \#pragma once (supported by all target compilers: MSVC, GCC, Clang).
+
+## 20.3 Error Handling
+
+- Assertions (ICUX_ASSERT) for programmer errors and invariant violations. Assert failures log a stack trace and terminate in debug builds.
+
+- std::expected\<T, Error\> (C++23, or a backport) for runtime failures: file not found, network timeout, asset load failure. Error codes propagate without exceptions.
+
+- Exceptions are disabled via compiler flag (-fno-exceptions / /EHs-) in all engine code. Third-party libraries that require exceptions are isolated behind wrapper modules.
+
+## 20.4 Code Review and Ownership
+
+Every module has a designated code owner (listed in a CODEOWNERS file). Pull requests modifying a module require approval from the owner. Cross-module changes require approval from all affected owners. Style is enforced by clang-format with a committed .clang-format configuration. Linting is enforced by clang-tidy in CI.
+
+# 21. Repository and Folder Structure
+
+> ICUXEngine/
+>
+> ├─ Source/
+>
+> │ ├─ Core/
+>
+> │ │ ├─ Memory/ — Linear, pool, stack, TLSF allocators
+>
+> │ │ ├─ Logging/ — Async logger, severity channels, crash handler
+>
+> │ │ ├─ Threading/ — Job system, work-stealing deques, sync barriers
+>
+> │ │ ├─ Time/ — High-resolution clock, fixed/variable timestep
+>
+> │ │ ├─ Serialization/ — Binary/TOML serialisers, schema versioning, ICUX_REFLECT
+>
+> │ │ └─ Profiling/ — CPU/GPU profiler, memory tracker, dev console
+>
+> │ ├─ Platform/
+>
+> │ │ ├─ Window/ — GLFW window management, event callbacks
+>
+> │ │ ├─ Input/ — Raw input capture, action mapping, input buffering
+>
+> │ │ └─ System/ — OS abstraction (file I/O, timers, hardware queries)
+>
+> │ ├─ Renderer/
+>
+> │ │ ├─ Backend/ — IRenderBackend interface
+>
+> │ │ ├─ Vulkan/ — VkDevice, swapchain, command pools, sync objects
+>
+> │ │ ├─ OpenGL/ — GL 4.6 Core Profile backend, DSA, SPIR-V ingestion
+>
+> │ │ ├─ RenderGraph/ — DAG pass scheduling, resource barriers, transient alloc
+>
+> │ │ ├─ Shaders/ — SPIR-V loading, permutation system, hot-reload
+>
+> │ │ ├─ Materials/ — PBR material definitions, material instances
+>
+> │ │ ├─ Mesh/ — Vertex/index buffer management, indirect draw
+>
+> │ │ ├─ Lighting/ — Clustered forward pipeline, shadow mapping (CSM, cubemap)
+>
+> │ │ ├─ Camera/ — View/projection matrices, reverse-Z, frustum extraction
+>
+> │ │ └─ PostProcessing/ — Tone mapping, bloom, TAA, SSAO, motion blur
+>
+> │ ├─ ECS/
+>
+> │ │ ├─ Entity/ — 64-bit entity IDs, generation counters, slot management
+>
+> │ │ ├─ Archetype/ — Archetype storage, component arrays, chunk allocation
+>
+> │ │ ├─ Components/ — Component type definitions, ICUX_REFLECT registration
+>
+> │ │ ├─ Systems/ — System base, access declaration, scheduler
+>
+> │ │ └─ Commands/ — Deferred command buffers for structural changes
+>
+> │ ├─ Scene/
+>
+> │ │ ├─ World/ — Scene graph, parent-child hierarchy
+>
+> │ │ ├─ Transforms/ — Local → world-space resolution
+>
+> │ │ ├─ Spatial/ — BVH for frustum culling, physics broad-phase, interest
+>
+> │ │ └─ Streaming/ — Cell management, async load/unload, priority queue
+>
+> │ ├─ Physics/
+>
+> │ │ ├─ JoltIntegration/ — Jolt wrapper, type conversion, collision layer config
+>
+> │ │ ├─ PhysicsWorld/ — World lifetime, step management, ECS sync
+>
+> │ │ └─ Queries/ — Raycast, shape cast, overlap queries
+>
+> │ ├─ Networking/
+>
+> │ │ ├─ Transport/ — GameNetworkingSockets wrapper, connection lifecycle
+>
+> │ │ ├─ Client/ — Prediction, input buffering, reconciliation
+>
+> │ │ ├─ Server/ — Authoritative sim, lag compensation, tick management
+>
+> │ │ ├─ Packets/ — Packet definitions, bitpacked serialisation
+>
+> │ │ └─ Replication/ — Entity replication, delta compression, interest mgmt
+>
+> │ ├─ Assets/
+>
+> │ │ ├─ AssetManager/ — Handle system, async loading, caching, LRU eviction
+>
+> │ │ ├─ Loaders/ — Per-type loaders (mesh, texture, shader, material)
+>
+> │ │ ├─ HotReload/ — File watcher, reload dispatch, dependent refresh
+>
+> │ │ └─ Packaging/ — Archive packing (.icux), index generation, LZ4
+>
+> │ ├─ Gameplay/
+>
+> │ │ ├─ Player/ — Controller, movement state machine, spawning
+>
+> │ │ ├─ Weapons/ — Weapon types, firing, ammo, reload, projectiles
+>
+> │ │ ├─ Health/ — Damage, death, respawn logic
+>
+> │ │ └─ Events/ — Gameplay event bus, event type definitions
+>
+> │ └─ Utilities/ — Math wrappers (glm), string utils, custom containers
+>
+> ├─ Include/
+>
+> │ └─ ICUX/
+>
+> │ ├─ Core/ — Public API headers for Core module
+>
+> │ ├─ Renderer/ — Public API headers for Renderer
+>
+> │ ├─ ECS/ — Public API headers for ECS
+>
+> │ └─ ... — (one directory per module)
+>
+> ├─ ThirdParty/
+>
+> │ ├─ Jolt/ — Jolt Physics
+>
+> │ ├─ VMA/ — Vulkan Memory Allocator
+>
+> │ ├─ glm/ — Math library
+>
+> │ ├─ GLFW/ — Windowing
+>
+> │ ├─ volk/ — Vulkan loader
+>
+> │ ├─ GameNetworkingSockets/ — Valve reliable-UDP transport
+>
+> │ └─ Catch2/ — Testing framework
+>
+> ├─ Tests/
+>
+> │ ├─ Unit/ — Per-module unit tests
+>
+> │ ├─ Integration/ — Multi-system integration tests
+>
+> │ └─ Performance/ — Benchmark scenarios for regression testing
+>
+> ├─ Tools/
+>
+> │ ├─ ShaderCompiler/ — GLSL → SPIR-V build scripts
+>
+> │ ├─ AssetPacker/ — Archive packing and index generation
+>
+> │ └─ CodeGen/ — Reflection macro expansion, component registration
+>
+> └─ Build/
+>
+> ├─ CMake/ — Module CMakeLists, toolchain files (Win/Linux)
+>
+> ├─ CI/ — Pipeline definitions (GitHub Actions / Jenkins)
+>
+> └─ Config/ — .clang-format, .clang-tidy, CODEOWNERS
+
+# 22. Phase 2 Roadmap
+
+The following systems are planned for Phase 2, building on the core runtime established in Phase 1. Phase 2 targets a production-ready vertical slice.
+
+| **System**               | **Priority** | **Dependencies**      | **Estimated Effort**                                                      |
+|--------------------------|--------------|-----------------------|---------------------------------------------------------------------------|
+| Skeletal Animation       | Critical     | ECS, Renderer, Assets | 6 months — blend trees, IK, animation graph, GPU skinning                 |
+| Audio Engine             | Critical     | ECS, Scene, Assets    | 4 months — spatial audio, HRTF, mixer, streaming, FMOD/Wwise integration  |
+| UI/HUD Framework         | Critical     | Renderer, Input, ECS  | 5 months — retained-mode UI, data binding, localisation, HUD widgets      |
+| Anti-Cheat               | High         | Networking, ECS       | 3 months — server-side validation, anomaly detection, encrypted transport |
+| Ray Tracing              | Medium       | Vulkan Renderer       | 4 months — RT reflections, RT GI (optional path), denoising               |
+| Console Ports (PS5/Xbox) | Medium       | Platform, Renderer    | 6 months — GNM/GNMX, D3D12 backend, platform certification                |
+| Advanced Rendering       | Medium       | Renderer              | Ongoing — virtual geometry, Lumen-style GI, nanite-style LOD              |
+| Cinematic Tools          | Low          | Animation, Camera, UI | 3 months — sequencer, cutscene playback, camera rail system               |
+| Visual Scripting         | Low          | ECS, Gameplay         | 4 months — node graph for designers, compiled to native for shipping      |
+| Modding Pipeline         | Low          | Assets, ECS, Gameplay | 3 months — sandboxed mod loading, asset override system                   |
+
+# 23. Glossary
+
+| **Term**       | **Definition**                                                                                                                       |
+|----------------|--------------------------------------------------------------------------------------------------------------------------------------|
+| Archetype      | A unique combination of component types. All entities with the same component set are stored together in one archetype.              |
+| BVH            | Bounding Volume Hierarchy. A spatial acceleration structure for fast culling and overlap queries.                                    |
+| CSM            | Cascaded Shadow Maps. Multiple shadow map cascades at different resolutions for a directional light, covering near to far distances. |
+| DSA            | Direct State Access. An OpenGL extension pattern that allows modifying objects without binding them to the context.                  |
+| ECS            | Entity Component System. Data-oriented architecture where entities are IDs, components are data, and systems are logic.              |
+| IBL            | Image-Based Lighting. Environment lighting derived from prefiltered HDR cubemaps and a BRDF lookup table.                            |
+| IRenderBackend | The abstract interface both Vulkan and OpenGL rendering backends implement.                                                          |
+| LRU            | Least Recently Used. Eviction strategy for asset caches.                                                                             |
+| PAL            | Platform Abstraction Layer. The lowest engine module providing OS-agnostic APIs.                                                     |
+| PBR            | Physically Based Rendering. Metallic-roughness material model.                                                                       |
+| Render Graph   | A DAG of render passes with explicit resource dependencies, enabling automatic barrier insertion and pass optimisation.              |
+| Reverse-Z      | Depth buffer mapping where near=1 and far=0, providing better floating-point precision at distance.                                  |
+| SoA            | Structure of Arrays. Memory layout where each field is stored in its own contiguous array. Preferred for cache-friendly iteration.   |
+| SPIR-V         | Standard Portable Intermediate Representation for Vulkan. Binary shader format consumed by both Vulkan and OpenGL 4.6.               |
+| TLSF           | Two-Level Segregated Fit. A real-time memory allocator with O(1) allocation and low fragmentation.                                   |
+| VMA            | Vulkan Memory Allocator. Industry-standard GPU memory sub-allocator by AMD.                                                          |
+
+*— End of Document —*
+
+ICUX Engine — Phase 1 Core Runtime Architecture — v0.0.0.0
+
+**CONFIDENTIAL — Engineering Eyes Only**

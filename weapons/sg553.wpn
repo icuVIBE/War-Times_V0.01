@@ -1,0 +1,39 @@
+# War Times Weapon Preset
+# SG553
+
+fire_rate = 0.1
+damage = 28
+range = 180
+max_ammo = 30
+reserve_ammo = 90
+reload_time = 2.2
+recoil_pitch = 1.8
+recoil_yaw = 0.4
+recoil_recovery = 5.5
+spread = 0.4
+ads_spread_mult = 0.25
+pellets_per_shot = 1
+automatic = 1
+
+gun_model = Gun/Sg553
+gun_texture = Guns/Sg553
+model_scale = 1
+model_offset = -0.12 0.04 -0.14
+model_rotation = 3 3 0
+arm_offset = -0.13 0.07 -0.19
+barrel_length = 0.55
+laser_offset = 0 0 0
+
+right_grip = 0 -0.04 -0.04
+right_grip_rot = 0 0 0
+left_grip = 0 -0.02 0.18
+left_grip_rot = 0 0 0
+elbow_pole = 0 -0.3 0
+
+flash_duration = 0.05
+flash_offset = 0.06 0.015 0
+flash_layer_count = 4
+flash_layer_0 = 0.025 0.025 0.03 0 0 0 0 1 1 0.95 1.2 0.3
+flash_layer_1 = 0.015 0.015 0.08 0.03 0 0 0 1 0.85 0.3 1 0.6
+flash_layer_2 = 0.04 0.012 0.015 0 0 0 0 1 0.7 0.2 1.5 0.4
+flash_layer_3 = 0.012 0.04 0.015 0 0 0 0 1 0.7 0.2 1.5 0.4

@@ -1,0 +1,603 @@
+**CONFIDENTIAL**
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+# ICUX ENGINE
+
+Production Systems Architecture
+
+Technical Design Document — Phase 1.5
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Version 0.0.0.0
+
+Classification: Internal — Engineering Eyes Only
+
+March 2026
+
+Prepared by: Engine Architecture Team
+
+Approved by: Technical Director / CTO
+
+# Revision History
+
+| **Version** | **Date**   | **Author**               | **Description**                         |
+|-------------|------------|--------------------------|-----------------------------------------|
+| 0.0.0.0     | 2026-03-20 | Engine Architecture Team | Initial Phase 1.5 architecture document |
+| 0.0.0.0     | 2026-03-15 | Principal Architect      | Internal review draft                   |
+
+# Table of Contents
+
+# 1. Executive Summary
+
+This document defines the Phase 1.5 architecture for ICUX Engine. Where Phase 1 established the core runtime (rendering, ECS, physics, networking, asset management), Phase 1.5 delivers the systems required to reach a production-ready vertical slice: a fully playable, visually representative, and content-complete demonstration of the game’s target experience.
+
+Phase 1.5 systems are not optional polish — they are hard dependencies for any shippable AAA first-person shooter. A game without animation, audio, or UI is a tech demo. Phase 1.5 transforms the ICUX Engine tech demo into a game.
+
+All systems in this document build on Phase 1 infrastructure: the ECS, the job system, the asset pipeline, the render graph, and the networking stack. No Phase 1 systems are redesigned; Phase 1.5 is purely additive.
+
+## 1.1 Phase 1.5 Scope
+
+| **System**                 | **Priority** | **Estimated Team** | **Estimated Duration** |
+|----------------------------|--------------|--------------------|------------------------|
+| Skeletal Animation         | Critical     | 8 engineers        | 6 months               |
+| Audio Engine               | Critical     | 5 engineers        | 4 months               |
+| UI/HUD Framework           | Critical     | 6 engineers        | 5 months               |
+| Particle and VFX System    | Critical     | 4 engineers        | 4 months               |
+| Anti-Cheat Framework       | High         | 3 engineers        | 3 months               |
+| Replay and Kill-Cam System | High         | 3 engineers        | 3 months               |
+| Telemetry and Analytics    | High         | 2 engineers        | 2 months               |
+| Localisation Framework     | Medium       | 2 engineers        | 2 months               |
+| Accessibility System       | Medium       | 2 engineers        | 2 months               |
+| Level Editor Integration   | High         | 6 engineers        | 5 months               |
+
+## 1.2 Dependencies on Phase 1
+
+Every Phase 1.5 system assumes the following Phase 1 infrastructure is stable and API-frozen:
+
+- ICUX::ECS — Archetype storage, system scheduling, command buffers
+
+- ICUX::Renderer — Render graph, material system, Vulkan and OpenGL backends
+
+- ICUX::Assets — Handle system, async loading, hot-reload
+
+- ICUX::Core — Job system, memory allocators, profiling, serialisation
+
+- ICUX::Networking — Replication, prediction, delta compression
+
+- ICUX::Physics — Jolt integration, raycast/shape-cast queries
+
+# 2. Skeletal Animation System
+
+The animation system is the single largest Phase 1.5 deliverable. Every visible character, weapon, and interactive object in a AAA FPS requires skeletal animation. The system must blend, layer, and transition between hundreds of animation clips at 120 FPS for 64 networked players simultaneously.
+
+## 2.1 Architecture Overview
+
+The animation system operates as an ECS system (ICUX::Animation) that reads SkeletonComponent and AnimationStateComponent data, evaluates animation graphs, computes final bone transforms, and writes results to a BoneMatrixBuffer consumed by the renderer’s GPU skinning pipeline. Animation evaluation runs in Phase 2 (Simulation) of the frame, parallelised across the job system. GPU skinning runs in Phase 4 (GPU Submit) as a compute dispatch before the main forward pass.
+
+## 2.2 Skeleton and Clip Data
+
+- **Skeleton:** A hierarchy of bones (joints) with bind-pose transforms. Stored as a flat array of parent indices and inverse bind matrices. Maximum bone count per skeleton: 256 (sufficient for high-fidelity humanoids with facial bones).
+
+- **Animation Clip:** A set of bone transform curves (position, rotation, scale) sampled at a fixed rate (typically 30 Hz source, interpolated at runtime). Clips are compressed using curve fitting and quantised quaternions (smallest-three encoding, 48 bits per rotation sample). Compressed clip size target: \<100 KB for a 2-second full-body animation.
+
+- **Animation Set:** A named collection of clips associated with a skeleton (e.g., “Soldier_AnimSet” containing Idle, Run, Sprint, Jump, ADS_Fire, Reload). Animation sets are loaded as a single asset with shared skeleton reference.
+
+## 2.3 Animation Graph
+
+Each animated entity has an Animation Graph — a data-driven state machine that controls clip selection, blending, and transitions. The graph is authored in a visual editor (Phase 1.5 Level Editor) and serialised as a binary asset.
+
+### 2.3.1 Graph Node Types
+
+| **Node Type**   | **Description**                                                     | **Example**                                                |
+|-----------------|---------------------------------------------------------------------|------------------------------------------------------------|
+| State           | Plays a single clip or blend tree. Has entry/exit transitions.      | Idle, Run, Sprint, Jump_Start, Jump_Air, Jump_Land         |
+| Blend Tree (1D) | Blends between 2+ clips based on a single parameter.                | Locomotion: blend Walk/Run/Sprint by speed parameter       |
+| Blend Tree (2D) | Blends across a 2D parameter space using barycentric interpolation. | Strafe: blend by (moveX, moveY) for 8-directional movement |
+| Layered Blend   | Additively or override-blends a clip on a masked bone set.          | Upper-body ADS overlay on top of locomotion lower-body     |
+| Transition      | Crossfade between states over a configurable duration.              | Idle → Run: 0.15s crossfade triggered by speed \> 0.1      |
+| Sub-Graph       | Embeds another graph as a single node for modularity.               | Weapon_SubGraph handles all reload/fire/inspect states     |
+
+## 2.4 Inverse Kinematics
+
+- **Foot IK:** Two-bone IK solver for foot placement on uneven terrain. Raycasts from hip height determine ground contact points; IK adjusts ankle and knee joints. Pelvis height is adjusted to accommodate the lowest foot.
+
+- **Hand IK:** Two-bone IK for weapon grip alignment. Off-hand position is driven by a socket on the weapon mesh. Ensures hands stay attached to the weapon regardless of animation blend state.
+
+- **Look-At IK:** Spinal chain IK (3–4 bones) for head/torso tracking toward a look-at target (crosshair direction). Weight falls off down the spine for natural posture.
+
+## 2.5 GPU Skinning
+
+Final bone matrices (model-space transform × inverse bind matrix) are uploaded to a GPU storage buffer each frame. A compute shader dispatches one thread per vertex, transforming vertices by bone weights (up to 4 bones per vertex). Skinned vertex positions and normals are written to a transient vertex buffer consumed by the forward rendering pass. This approach avoids CPU vertex transformation entirely and scales with GPU parallelism.
+
+## 2.6 Animation Networking
+
+Animation state is not replicated bone-by-bone — bandwidth would be prohibitive for 64 players. Instead, the server replicates animation graph parameters (current state ID, blend weights, transition progress, IK target positions) as part of the entity snapshot. Clients evaluate the animation graph locally from these parameters, producing visually identical results without transmitting raw bone data. Bandwidth cost per animated entity: approximately 40–80 bytes per snapshot.
+
+## 2.7 Memory Budget
+
+| **Resource**            | **Budget** | **Notes**                                               |
+|-------------------------|------------|---------------------------------------------------------|
+| Skeleton data           | 16 MB      | All unique skeletons in a level (typically 5–10)        |
+| Compressed clips (CPU)  | 128 MB     | Full animation set library for all character archetypes |
+| Decompressed pose cache | 32 MB      | Per-frame evaluated poses, ring-buffered                |
+| GPU bone matrices       | 16 MB      | 64 players × 256 bones × 64 bytes per matrix            |
+| Total animation system  | 192 MB     | Within engine’s 2 GB runtime budget                     |
+
+# 3. Audio Engine
+
+The audio engine provides spatial 3D sound, real-time mixing, dynamic music, and voice chat integration. Audio is a critical component of competitive FPS gameplay: players rely on directional audio cues (footsteps, reloads, gunfire) for situational awareness. The system must deliver low-latency, high-fidelity audio with minimal CPU overhead.
+
+## 3.1 Architecture
+
+ICUX Engine integrates a professional audio middleware layer rather than building a full audio engine from scratch. The two evaluated options are FMOD Studio and Wwise. Both provide spatial audio, HRTF (Head-Related Transfer Function) rendering, real-time mixing, dynamic music, and cross-platform support. The middleware is wrapped behind an ICUX::Audio interface so that the specific middleware can be swapped without affecting gameplay code.
+
+### 3.1.1 Middleware Evaluation
+
+| **Criteria**          | **FMOD Studio**                                                          | **Wwise**                                                               |
+|-----------------------|--------------------------------------------------------------------------|-------------------------------------------------------------------------|
+| Spatial audio quality | Excellent. Built-in object-based spatialization, resonance audio plugin. | Excellent. Spatial Audio with room/portal geometry, Ambisonics support. |
+| HRTF                  | Supported via Resonance Audio plugin or third-party.                     | Built-in HRTF with customisable profiles.                               |
+| Designer tooling      | FMOD Studio — intuitive timeline-based event editor.                     | Wwise Authoring — powerful but steeper learning curve.                  |
+| Occlusion/obstruction | Built-in geometry-based occlusion.                                       | Spatial Audio rooms and portals for geometry-driven occlusion.          |
+| Platform support      | Windows, Linux, PS5, Xbox, Switch.                                       | Windows, Linux, PS5, Xbox, Switch.                                      |
+| Licensing             | Indie free tier, AAA tiered licensing.                                   | Indie free tier, AAA tiered licensing.                                  |
+| Recommendation        | Primary choice for ICUX Engine                                           | Viable alternative                                                      |
+
+## 3.2 Sound Categories and Bus Structure
+
+| **Bus**          | **Content**                                      | **Priority** | **Max Voices** |
+|------------------|--------------------------------------------------|--------------|----------------|
+| Master           | Final output mix                                 | —            | —              |
+| SFX_Weapons      | Gunfire, explosions, impacts, projectile flybys  | Critical     | 32             |
+| SFX_Player       | Footsteps, movement, equipment rattle, breathing | Critical     | 16             |
+| SFX_Environment  | Ambient loops, weather, machinery, doors         | Medium       | 24             |
+| SFX_UI           | Menu clicks, hit markers, kill feed sounds       | High         | 8              |
+| Voice_Comms      | Team voice chat (Opus codec)                     | Critical     | 16             |
+| Voice_Characters | Barks, callouts, announcers                      | High         | 8              |
+| Music            | Dynamic music layers, stingers, menu music       | Low          | 4              |
+
+## 3.3 Spatial Audio Pipeline
+
+Every sound-emitting entity has an AudioSourceComponent with a 3D position (derived from TransformComponent), attenuation curve (linear, logarithmic, or custom), minimum/maximum distance, and occlusion flag. Each frame, the audio system iterates all active audio sources, calculates listener-relative position using the camera’s transform, and submits 3D positioning data to the middleware. Occlusion is calculated using physics raycasts between the listener and each audible source; occluded sounds are low-pass filtered with attenuation proportional to obstruction thickness.
+
+## 3.4 Footstep System
+
+Footsteps are driven by animation events. The animation graph fires a “FootDown” event at the contact frame of each step cycle. The audio system receives the event, performs a short downward raycast from the foot bone position to determine the surface material (via physics material tags on colliders: concrete, metal, grass, water, gravel), and selects a randomised footstep sound from the appropriate material sound bank. Footstep volume and audible range scale with movement speed (walk \< run \< sprint) and stance (crouched is quieter).
+
+## 3.5 Weapon Audio
+
+Weapon sounds are multi-layered: a close-range “mechanism” layer, a mid-range “report” layer, and a distant “tail” layer that varies by environment (indoor reverb vs outdoor decay). The layers are blended based on listener distance from the firing point. First-person weapon sounds (heard by the shooter) use a separate, more detailed mix than third-person sounds heard by other players. Automatic weapons use seamless looping fire sounds with randomised start offsets to avoid machine-gun repetition.
+
+## 3.6 Dynamic Music System
+
+Music is implemented as a set of horizontal layers (stems) that are mixed in and out based on gameplay state. States include: Ambient (exploration, low tension), Combat_Low (enemy nearby), Combat_High (active firefight, health low), Victory (round win), Defeat (round loss). Transitions between music states use crossfades with configurable durations and quantisation to musical bar boundaries to avoid jarring cuts.
+
+## 3.7 Voice Chat Integration
+
+Real-time voice communication uses the Opus codec (48 kHz, 20 ms frames, ~32 kbps per player). Voice data is transmitted on a separate unreliable channel from game state, routed through the server for team-based filtering and mute enforcement. Client-side, incoming voice is decoded and spatialized in the 3D sound field (teammates are heard from their in-world position, with a minimum audibility floor). Push-to-talk is the default; open-mic with noise gate is optional. Voice chat bandwidth: approximately 4 KB/s per speaking player.
+
+## 3.8 Audio Memory Budget
+
+| **Resource**             | **Budget** | **Notes**                                      |
+|--------------------------|------------|------------------------------------------------|
+| Loaded sound banks (CPU) | 256 MB     | All sound banks for active level               |
+| Streaming buffer         | 32 MB      | Music and ambient loops streamed from disk     |
+| Decode/mix buffer        | 16 MB      | Real-time mixing workspace                     |
+| Voice chat buffers       | 8 MB       | Decode buffers for 16 concurrent voice streams |
+| Total audio system       | 312 MB     | Within engine’s expanded Phase 1.5 budget      |
+
+# 4. UI/HUD Framework
+
+The UI/HUD system provides all 2D interface rendering: heads-up display elements during gameplay (crosshair, health bar, ammo counter, minimap, kill feed, scoreboard), menu screens (main menu, settings, server browser, loadout selection), and modal dialogs (pause menu, disconnection warnings). The system must render at native resolution on top of the 3D scene with negligible GPU cost.
+
+## 4.1 Architecture
+
+ICUX Engine uses a retained-mode UI architecture. The UI is described as a tree of widget objects (Panel, Text, Image, Button, Slider, ScrollView, ProgressBar). The tree is rebuilt or mutated in response to gameplay events and data binding updates. Each frame, the UI system traverses the widget tree, performs layout (flexbox-style), generates a draw list of textured quads and text glyphs, and submits it as a dedicated render pass at the end of the render graph (after post-processing, before present).
+
+## 4.2 Widget System
+
+| **Widget**  | **Description**                                                                                      | **HUD Use**                                | **Menu Use**                   |
+|-------------|------------------------------------------------------------------------------------------------------|--------------------------------------------|--------------------------------|
+| Panel       | Container with background, border, padding. Flexbox layout.                                          | Ammo panel, health panel                   | Menu sections, cards           |
+| Text        | Rendered via SDF (Signed Distance Field) font atlas. Supports rich text (bold, colour, size inline). | Kill feed, damage numbers, timer           | Labels, descriptions, tooltips |
+| Image       | Textured quad. Supports 9-slice scaling, tinting, and atlas regions.                                 | Crosshair, weapon icon, minimap            | Backgrounds, icons, thumbnails |
+| Button      | Interactive panel with hover/press/disabled states. Fires onClick action.                            | —                                          | Menu buttons, loadout slots    |
+| Slider      | Draggable track with value binding. Horizontal or vertical.                                          | —                                          | Volume, sensitivity, FOV       |
+| ProgressBar | Fill bar with configurable direction and colour gradient.                                            | Health bar, reload bar, objective progress | Loading bar, XP bar            |
+| ScrollView  | Clipped container with scrollbar and inertia scrolling.                                              | —                                          | Server browser, loadout list   |
+| InputField  | Text entry with cursor, selection, clipboard support.                                                | —                                          | Player name, chat, search      |
+
+## 4.3 Layout System
+
+Layout uses a flexbox-inspired model. Each widget has: direction (row or column), alignment (start, centre, end, stretch), spacing, padding, and sizing (fixed, percentage, grow-to-fill). Layout is computed in a two-pass algorithm: measure pass (bottom-up, each widget reports its desired size) and arrange pass (top-down, parent assigns final position and size to children). Layout is recalculated only when the widget tree is marked dirty (content change, window resize, data binding update), not every frame.
+
+## 4.4 Data Binding
+
+HUD widgets bind to game state through a reactive data binding layer. Gameplay systems write to observable properties on HUD data models (e.g., PlayerHUDData.health, PlayerHUDData.ammoCount). When a property changes, the binding system marks the affected widgets dirty and triggers a layout/redraw. This eliminates polling: the HUD only updates when game state actually changes. Bindings are declared in the widget definition file (TOML), not in C++ code.
+
+## 4.5 Rendering
+
+The UI renderer batches all widget draw calls into a minimal number of draw calls per frame. Widgets sharing the same texture atlas and blend mode are merged into a single indexed draw call. Text rendering uses SDF font atlases generated offline; SDF provides resolution-independent text sharpness at any scale without per-resolution texture variants. The UI render pass writes to the final swapchain target with alpha blending over the post-processed 3D scene. Target GPU cost for the full HUD at 4K: \< 0.5 ms.
+
+## 4.6 HUD Elements (FPS-Specific)
+
+- **Crosshair:** Dynamic crosshair that expands with weapon spread and movement. Customisable style (dot, cross, circle) and colour per player preference.
+
+- **Health and Armour:** Segmented health bar with damage flash (red vignette on hit). Armour displayed as a secondary bar.
+
+- **Ammo Counter:** Magazine / reserve display. Low-ammo warning pulse. Reload progress bar.
+
+- **Minimap:** Top-down orthographic render of nearby area. Teammate blips, objective markers, directional damage indicator.
+
+- **Kill Feed:** Scrolling list of recent kills/deaths with weapon icon, attacker name, victim name. Fades after 5 seconds.
+
+- **Scoreboard:** Full match scoreboard (hold Tab). Columns: player, kills, deaths, assists, ping. Sorted by score.
+
+- **Damage Numbers:** Floating damage values at hit location. Headshot bonus highlighted. Configurable: on/off, stacking, colour.
+
+- **Objective Markers:** World-space UI elements anchored to 3D positions (bomb sites, capture points). Clamped to screen edge when off-screen with distance readout.
+
+## 4.7 Screen-Space and World-Space UI
+
+The framework supports two coordinate spaces. Screen-space UI (HUD, menus) is laid out in a virtual canvas (1920×1080 reference resolution, scaled to display resolution). World-space UI (objective markers, nameplates, interaction prompts) is projected from 3D world coordinates to screen coordinates each frame using the camera’s view-projection matrix, with depth-tested visibility and distance-based scaling.
+
+# 5. Particle and VFX System
+
+The particle system handles all transient visual effects: muzzle flashes, bullet impacts, explosions, smoke, fire, sparks, blood, environmental dust, and weather particles. A AAA FPS can have thousands of active particles per frame during intense combat. The system must be GPU-accelerated to avoid consuming CPU budget.
+
+## 5.1 Architecture
+
+ICUX Engine uses a hybrid CPU/GPU particle system. Particle emitter definitions (spawn rate, lifetime, initial velocity, forces, colour/size curves) are data-driven assets authored in a visual editor. Particle simulation (position integration, force application, collision, lifetime decay) runs as a compute shader on the GPU. The CPU is responsible only for emitter lifetime management, LOD decisions, and GPU dispatch commands.
+
+## 5.2 Emitter Types
+
+| **Type**             | **Simulation**                  | **Rendering**                      | **Use Cases**                               |
+|----------------------|---------------------------------|------------------------------------|---------------------------------------------|
+| Billboard Sprite     | GPU compute                     | Camera-facing textured quads       | Smoke, fire, sparks, blood, dust            |
+| Mesh Particle        | GPU compute                     | Instanced mesh rendering           | Shell casings, debris, shrapnel             |
+| Trail / Ribbon       | GPU compute (vertex generation) | Triangle strip along particle path | Bullet tracers, rocket trails, sword swings |
+| GPU Fluid (Flipbook) | Pre-simulated flipbook texture  | Billboard with animated UV         | Explosions, large smoke plumes              |
+| Beam                 | CPU (endpoint-driven)           | Tessellated beam geometry          | Lasers, lightning, tether effects           |
+
+## 5.3 GPU Simulation Pipeline
+
+Each active emitter has a GPU buffer storing particle state (position, velocity, lifetime, size, colour, rotation). A compute dispatch runs once per frame per emitter: the spawn kernel appends new particles, the simulate kernel integrates forces and applies drag, and the compact kernel removes dead particles via stream compaction. An indirect draw buffer is updated with the live particle count so the renderer issues exactly the right number of draw calls with no CPU readback.
+
+## 5.4 Particle Collision
+
+Particles that require world collision (debris, shell casings, blood splatter) sample the depth buffer from the previous frame to detect surface intersections. On collision, particles either bounce (with configurable restitution and friction), stick to the surface, or spawn a decal. Depth-buffer collision is approximate but sufficient for visual effects and avoids per-particle physics raycasts.
+
+## 5.5 Level of Detail
+
+Particle emitters have LOD tiers based on distance from the camera. At maximum distance, spawn rate is reduced by 75%, simulation is skipped for non-visible emitters, and rendering switches from full billboard to simplified low-resolution particles. Emitters beyond the maximum LOD distance are culled entirely. This ensures particle cost scales with visual impact rather than world complexity.
+
+## 5.6 FPS-Specific Effects
+
+- **Muzzle Flash:** Multi-layer effect: point light (1 frame duration), billboard sprite, smoke puff. Randomised rotation per shot to avoid repetition. First-person and third-person variants with different scale and camera offset.
+
+- **Bullet Impact:** Surface-material-driven effect selection (concrete dust, metal sparks, wood splinters, blood). Decal spawned at impact point with normal alignment. Sound event triggered simultaneously.
+
+- **Explosion:** Flipbook smoke cloud + radial debris mesh particles + shockwave distortion (screen-space) + point light (decay over 0.5s) + camera shake. Scalable by explosion radius.
+
+- **Environmental:** Persistent ambient emitters: dust motes in light shafts, rain, snow, fog wisps, ember particles near fire sources. Streamed with level cells.
+
+## 5.7 Memory Budget
+
+| **Resource**              | **Budget** | **Notes**                                      |
+|---------------------------|------------|------------------------------------------------|
+| GPU particle buffers      | 64 MB      | All active emitters, double-buffered           |
+| Particle textures/atlases | 32 MB      | Shared sprite atlases, flipbook sheets         |
+| CPU emitter state         | 4 MB       | Emitter metadata, LOD state, dispatch commands |
+| Total VFX system          | 100 MB     |                                                |
+
+# 6. Anti-Cheat Framework
+
+Anti-cheat is not a Phase 2 luxury for a competitive multiplayer FPS — it is a hard requirement for any public-facing playtest. The ICUX anti-cheat strategy is layered: server-side authoritative validation (primary), statistical anomaly detection (secondary), and optional client-side integrity checks (tertiary, for ranked/competitive modes).
+
+## 6.1 Server-Side Validation (Primary)
+
+Because ICUX Engine uses a server-authoritative networking model, the server already has full authority over game state. Anti-cheat validation is an extension of this authority.
+
+| **Cheat Category**     | **Server Validation**                                                                           | **Detection Method**                                                                                |
+|------------------------|-------------------------------------------------------------------------------------------------|-----------------------------------------------------------------------------------------------------|
+| Speed hack             | Server validates movement delta per tick against maximum allowed velocity (sprint + tolerance). | If player position delta exceeds max distance per tick for N consecutive ticks, reject and correct. |
+| Teleportation          | Server validates that position changes are physically reachable.                                | Position delta \> maximum possible in one tick → reject, log, snap to last valid position.          |
+| Damage hack            | Server calculates all damage. Client damage values are never trusted.                           | Client claims are ignored; server performs its own hitscan raycast with lag compensation.           |
+| Ammo/resource hack     | Server tracks ammo, health, cooldowns authoritatively.                                          | Client requests (fire, ability) rejected if server state shows insufficient resources.              |
+| Wallhack (information) | Interest management limits entity visibility to what the player should see.                     | Entities behind walls or outside interest radius are not sent to the client at all.                 |
+| Rate-of-fire hack      | Server enforces minimum fire interval per weapon.                                               | Fire requests arriving faster than weapon fire rate are dropped.                                    |
+
+## 6.2 Statistical Anomaly Detection
+
+A server-side analytics pipeline records per-player statistics: accuracy, headshot percentage, reaction time distribution, kill/death ratio, movement patterns, and aim trajectory smoothness. A baseline is established per skill tier. Players exceeding statistical thresholds (e.g., \>60% headshot rate sustained over 50+ kills, inhuman reaction times below 100 ms consistently, unnaturally smooth aim trajectories) are flagged for review. Flagged accounts are routed to a manual review queue or an automated escalation tier depending on confidence score.
+
+## 6.3 Client-Side Integrity (Ranked Mode)
+
+For ranked and competitive playlists, optional client-side integrity checks are enabled: process memory scanning for known cheat signatures, DLL injection detection, and game binary hash verification. These checks run in a sandboxed thread and report results to the server. A failed integrity check results in match suspension and account flagging. Client-side anti-cheat is not relied upon as a primary defence — it is a supplementary signal.
+
+## 6.4 Encrypted Transport
+
+All client-server communication is encrypted via GameNetworkingSockets’ built-in DTLS encryption. This prevents packet sniffing, replay attacks, and man-in-the-middle injection. Authentication tokens are short-lived (15-minute expiry) and refreshed via a secure backend handshake.
+
+# 7. Replay and Kill-Cam System
+
+The replay system allows full-match playback and short kill-cam sequences. Replay data is essential for competitive integrity (dispute resolution), content creation (player highlights), and anti-cheat review.
+
+## 7.1 Architecture
+
+The replay system records server-side state snapshots at the full tick rate (64 Hz). Each snapshot contains all replicated entity state: positions, rotations, animation parameters, weapon state, health, and gameplay events (kills, objectives). Snapshots are delta-compressed against the previous snapshot and written to a circular buffer in memory. At match end (or on demand), the buffer is flushed to a replay file (.icuxrep).
+
+## 7.2 Playback
+
+Replay playback instantiates a local simulation that reads snapshots from the replay file instead of from the network. Entities are interpolated between snapshots identically to live interpolation. The playback client supports: play, pause, speed control (0.25× to 4×), timeline scrubbing, free-camera mode, and player-perspective lock. All rendering, animation, audio, and particle systems operate normally during playback.
+
+## 7.3 Kill-Cam
+
+On death, the client requests a 5-second replay segment from the server covering the killing blow. The server extracts the relevant snapshot window, compresses it, and sends it to the victim client. The kill-cam plays in a picture-in-picture overlay showing the attacker’s perspective: their position, aim direction, weapon, and the victim’s position at the moment of death. Kill-cam data is approximately 2–4 KB per event.
+
+## 7.4 Storage
+
+| **Metric**                       | **Value**                   | **Notes**                                                      |
+|----------------------------------|-----------------------------|----------------------------------------------------------------|
+| Snapshot size (delta compressed) | ~2 KB per tick (64 players) | Delta compression reduces full snapshot from ~40 KB to ~2 KB   |
+| Full match recording (30 min)    | ~230 MB                     | 64 Hz × 1800s × 2 KB. Further compressible to ~80 MB with LZ4. |
+| Kill-cam segment                 | ~2–4 KB                     | 5-second window, single perspective                            |
+| In-memory buffer                 | 64 MB ring buffer           | Stores last ~30 seconds for instant replay                     |
+
+# 8. Telemetry and Analytics
+
+The telemetry system captures structured gameplay events and performance metrics in real-time, transmits them to a backend analytics service, and provides an in-engine debug overlay for development builds. Telemetry data drives balance tuning, matchmaking calibration, crash reporting, performance regression detection, and anti-cheat anomaly detection.
+
+## 8.1 Event Categories
+
+| **Category** | **Example Events**                                                            | **Frequency**   |
+|--------------|-------------------------------------------------------------------------------|-----------------|
+| Gameplay     | PlayerKill, PlayerDeath, WeaponFired, ObjectiveCaptured, MatchStart, MatchEnd | Per occurrence  |
+| Economy      | LoadoutSelected, ItemPurchased, CurrencyEarned (if applicable)                | Per occurrence  |
+| Performance  | FrameTime, GPUTime, CPUTime, MemoryUsage, DrawCallCount                       | Once per second |
+| Network      | RTT, PacketLoss, PredictionError, BandwidthUsage                              | Once per second |
+| Crashes      | CrashDump, StackTrace, LastLogLines, HardwareInfo                             | On crash        |
+| Session      | SessionStart, SessionEnd, MapLoaded, DisconnectReason                         | Per occurrence  |
+
+## 8.2 Transport
+
+Telemetry events are serialised as compact binary messages (schema-versioned, same framework as network packets), batched into 1-second intervals, and transmitted to the analytics backend via HTTPS POST. Events are queued in a ring buffer; if the backend is unreachable, events are held in the buffer (up to 5 MB) and retransmitted on reconnection. Telemetry transmission runs on a dedicated low-priority thread and never impacts frame budget.
+
+## 8.3 Privacy and Compliance
+
+Telemetry data collection complies with GDPR and applicable data protection regulations. Players are presented with a clear consent dialog on first launch. Telemetry can be disabled entirely in settings. No personally identifiable information (PII) is included in telemetry events — players are identified by opaque session tokens. Data retention policies are enforced server-side.
+
+# 9. Localisation Framework
+
+The localisation system supports translation of all player-facing text, date/time formatting, number formatting, and right-to-left (RTL) text layout. The framework is designed for 15+ language targets at launch.
+
+## 9.1 Architecture
+
+- **String Tables:** All player-facing strings are externalised into string table assets (.icuxloc). Each table maps a string key (e.g., HUD_HEALTH, MENU_PLAY, WEAPON_RELOAD) to a translated string. String tables are per-language, per-asset-package.
+
+- **Runtime Lookup:** The Loc system provides a Loc::Get(key) function that returns the string for the active language. Lookups are O(1) via a hash map. If a key is missing in the active language, the system falls back to English and logs a warning.
+
+- **Pluralisation:** ICU MessageFormat syntax is supported for plural rules (English: 1 item / N items; Russian: complex plural categories; Arabic: dual form). Format strings are pre-compiled at asset load time.
+
+- **RTL Support:** Arabic, Hebrew, and other RTL languages are supported via bidirectional text layout in the UI framework. Widget mirroring (swap left/right alignment) is automatic when an RTL language is active.
+
+## 9.2 Font Coverage
+
+SDF font atlases are generated per script family. Latin, Cyrillic, Greek, CJK (Chinese, Japanese, Korean), Arabic, Thai, and Devanagari are required for target markets. CJK fonts use a streaming atlas: glyphs are rasterised on demand and cached in a GPU texture atlas, as the full CJK glyph set (~20,000+ characters) exceeds practical atlas size. Atlas size: 2048×2048 per script family.
+
+## 9.3 Workflow
+
+Translators work with exported XLIFF files (industry-standard translation interchange format). A build-pipeline step converts XLIFF back to .icuxloc binary string tables. Hot-reload is supported in development builds: modifying an XLIFF file triggers recompilation and runtime refresh of all affected strings.
+
+# 10. Accessibility System
+
+Accessibility is not optional for a AAA release. ICUX Engine’s accessibility system provides features for players with visual, auditory, motor, and cognitive needs. These features are integrated at the engine level so that all games built on ICUX benefit without per-title reimplementation.
+
+## 10.1 Visual Accessibility
+
+- **Colour-Blind Modes:** Three profiles: Protanopia, Deuteranopia, Tritanopia. Applied as a post-processing colour transform pass in the render graph. Affects HUD colours, team indicators, minimap markers, and crosshair.
+
+- **HUD Scaling:** Global HUD scale slider (75%–200%). All UI widgets honour the scale factor. Text minimum size: 18px at 1080p reference.
+
+- **High Contrast Mode:** Outlines on players and interactive objects (edge-detection post-process). Simplified HUD with maximum contrast backgrounds.
+
+- **Subtitle System:** Subtitles for all dialogue, callouts, and announcements. Configurable: size, background opacity, speaker identification, directional indicator.
+
+## 10.2 Auditory Accessibility
+
+- **Visual Sound Indicators:** On-screen directional indicators for critical sounds (gunfire, footsteps, explosions, voice comms). Displayed as radial pips around the crosshair with distance-based scaling.
+
+- **Mono Audio:** Option to downmix spatial audio to mono for single-ear hearing.
+
+- **Audio Visualiser:** Optional spectral visualiser overlay for full audio representation.
+
+## 10.3 Motor Accessibility
+
+- **Full Rebinding:** Every gameplay action is rebindable to any input. Modifier keys supported. Multiple inputs per action.
+
+- **Toggle Options:** ADS (aim down sights), sprint, and crouch can each be set to hold or toggle independently.
+
+- **Aim Assist:** Configurable aim slowdown and magnetism for controller input (not available in ranked). Sensitivity curves customisable.
+
+- **Auto-Sprint:** Movement input above a configurable threshold automatically triggers sprint.
+
+## 10.4 Cognitive Accessibility
+
+- **Simplified HUD:** Preset that reduces HUD to essential elements only (crosshair, health, ammo).
+
+- **Ping System:** Contextual ping (mark enemy, mark location, request help) for communication without voice or text.
+
+- **Tutorial Pacing:** Tutorials can be paused, replayed, and slowed. No timed tutorial sections.
+
+# 11. Level Editor Integration
+
+Phase 1.5 integrates a level editor that allows content teams (level designers, environment artists, lighting artists, audio designers) to build and iterate on game levels without modifying C++ code. The editor runs as a separate process that communicates with a running ICUX Engine instance for live preview.
+
+## 11.1 Architecture
+
+The editor is a standalone application built on a cross-platform UI framework (Qt 6 or ImGui-based). It communicates with ICUX Engine via a local TCP connection, sending commands (place entity, modify transform, change material, adjust light) and receiving the rendered viewport as a shared texture or streamed framebuffer. This architecture allows the editor to crash without taking down the engine and vice versa.
+
+## 11.2 Core Features
+
+| **Feature**        | **Description**                                                                                                               | **Users**                            |
+|--------------------|-------------------------------------------------------------------------------------------------------------------------------|--------------------------------------|
+| Entity Placement   | Drag-and-drop entity placement from an asset browser. Transform gizmos (translate, rotate, scale) with snap-to-grid.          | Level designers, environment artists |
+| Property Inspector | Per-entity component editor. All ECS component fields are exposed via the ICUX_REFLECT metadata. Live editing with undo/redo. | All content creators                 |
+| Terrain Editing    | Heightmap sculpting and painting. Multi-layer material splatting. Procedural scatter (grass, rocks, debris).                  | Environment artists                  |
+| Lighting Tools     | Place and configure lights. Real-time lightmap preview. IBL probe placement. Time-of-day slider for directional light.        | Lighting artists                     |
+| Navmesh Generation | Automatic navmesh bake for AI pathfinding (Phase 2 AI). Manual navmesh region marking (walkable, non-walkable, jump link).    | Level designers                      |
+| Audio Zones        | Place ambient audio emitters, reverb zones, and occlusion portals. Live audio preview via FMOD/Wwise editor integration.      | Audio designers                      |
+| Animation Preview  | Preview skeletal animations on placed entities. Scrub animation timeline. Test animation graph transitions.                   | Animators                            |
+| Play-In-Editor     | Launch a play session directly from the editor. Editor camera transitions to player camera. Exit returns to editor state.     | All                                  |
+
+## 11.3 Undo/Redo and Collaboration
+
+All editor operations are recorded as commands in an undo stack. Commands are invertible: undo replays the inverse command. The undo stack persists per editing session (up to 1000 operations). For multi-user collaboration, a locking system prevents two editors from modifying the same level cell simultaneously. Lock granularity is per-cell, matching the level streaming system’s cell grid.
+
+## 11.4 Asset Browser
+
+The editor provides a filterable, searchable asset browser that displays all available assets (meshes, materials, textures, prefabs, sounds, animation sets) with thumbnail previews. Assets are organised by type and directory. Drag-and-drop from the browser to the viewport instantiates the asset as an entity. The browser respects the asset pipeline: newly imported assets appear after build-pipeline processing without editor restart.
+
+# 12. Performance Targets (Phase 1.5)
+
+Phase 1.5 systems add CPU and GPU cost on top of Phase 1 budgets. The following targets ensure the 120 FPS / 8.33 ms frame budget is maintained with all Phase 1.5 systems active.
+
+| **System**               | **CPU Budget**                    | **GPU Budget**                | **Memory Budget**            |
+|--------------------------|-----------------------------------|-------------------------------|------------------------------|
+| Animation (64 players)   | 1.0 ms                            | 0.3 ms (GPU skinning compute) | 192 MB                       |
+| Audio (128 voices)       | 0.5 ms                            | 0 ms (CPU mixed)              | 312 MB                       |
+| UI/HUD                   | 0.2 ms                            | 0.5 ms (draw + text SDF)      | 64 MB                        |
+| Particles/VFX            | 0.1 ms (dispatch only)            | 0.8 ms (GPU sim + render)     | 100 MB                       |
+| Anti-cheat (server)      | 0.3 ms per tick                   | 0 ms                          | 16 MB                        |
+| Replay recording         | 0.2 ms                            | 0 ms                          | 64 MB ring buffer            |
+| Telemetry                | \< 0.05 ms                        | 0 ms                          | 8 MB                         |
+| Phase 1.5 total          | 2.35 ms                           | 1.6 ms                        | 756 MB                       |
+| Phase 1 budget remaining | 5.98 ms                           | 6.73 ms                       | —                            |
+| Combined Phase 1 + 1.5   | ~4.5 ms CPU / ~3.8 ms GPU typical | —                             | ~2.7 GB total engine runtime |
+
+# 13. Phase 1.5 Folder Structure Additions
+
+> ICUXEngine/
+>
+> ├─ Source/
+>
+> │ ├─ Animation/
+>
+> │ │ ├─ Skeleton/ — Bone hierarchy, bind pose, inverse bind matrices
+>
+> │ │ ├─ Clips/ — Clip loading, curve decompression, sampling
+>
+> │ │ ├─ Graph/ — Animation graph evaluation, state machine, blend trees
+>
+> │ │ ├─ IK/ — Foot IK, hand IK, look-at IK solvers
+>
+> │ │ └─ Skinning/ — GPU skinning compute dispatch, bone matrix upload
+>
+> │ ├─ Audio/
+>
+> │ │ ├─ Middleware/ — FMOD/Wwise wrapper, IAudioBackend interface
+>
+> │ │ ├─ Spatial/ — 3D positioning, occlusion raycasts, HRTF
+>
+> │ │ ├─ Music/ — Dynamic music state machine, stem mixing
+>
+> │ │ └─ Voice/ — Opus codec, voice chat routing, noise gate
+>
+> │ ├─ UI/
+>
+> │ │ ├─ Widgets/ — Panel, Text, Image, Button, Slider, ScrollView
+>
+> │ │ ├─ Layout/ — Flexbox layout engine, measure/arrange passes
+>
+> │ │ ├─ Rendering/ — UI batch renderer, SDF text, atlas management
+>
+> │ │ ├─ DataBinding/ — Observable properties, reactive widget updates
+>
+> │ │ └─ HUD/ — FPS-specific HUD widget prefabs and data models
+>
+> │ ├─ VFX/
+>
+> │ │ ├─ Emitters/ — Emitter definitions, lifetime management, LOD
+>
+> │ │ ├─ GPUSimulation/ — Compute shaders: spawn, simulate, compact
+>
+> │ │ ├─ Renderers/ — Billboard, mesh, trail, beam particle renderers
+>
+> │ │ └─ Collision/ — Depth-buffer collision, decal spawning
+>
+> │ ├─ AntiCheat/
+>
+> │ │ ├─ ServerValidation/ — Movement, damage, rate-of-fire validation
+>
+> │ │ ├─ AnomalyDetection/ — Statistical player profiling, flagging
+>
+> │ │ └─ ClientIntegrity/ — Memory scanning, DLL detection (ranked only)
+>
+> │ ├─ Replay/
+>
+> │ │ ├─ Recorder/ — Snapshot capture, delta compression, ring buffer
+>
+> │ │ ├─ Playback/ — Replay reader, timeline control, free camera
+>
+> │ │ └─ KillCam/ — Kill-cam extraction, PiP rendering
+>
+> │ ├─ Telemetry/
+>
+> │ │ ├─ Events/ — Event definitions, serialisation
+>
+> │ │ └─ Transport/ — HTTPS batching, ring buffer, retry logic
+>
+> │ ├─ Localisation/
+>
+> │ │ ├─ StringTable/ — .icuxloc loading, hash-map lookup, fallback
+>
+> │ │ ├─ Formatting/ — ICU MessageFormat, plural rules, date/number
+>
+> │ │ └─ Fonts/ — SDF atlas generation, CJK streaming atlas
+>
+> │ └─ Accessibility/
+>
+> │ ├─ Visual/ — Colour-blind filters, HUD scaling, high contrast
+>
+> │ ├─ Auditory/ — Visual sound indicators, mono downmix
+>
+> │ └─ Motor/ — Rebinding system, toggle options, aim assist
+>
+> ├─ Editor/
+>
+> │ ├─ Core/ — Editor application, TCP bridge to engine
+>
+> │ ├─ Viewport/ — 3D viewport, transform gizmos, camera controls
+>
+> │ ├─ Inspector/ — Component property editor, ICUX_REFLECT integration
+>
+> │ ├─ AssetBrowser/ — Thumbnail generation, search, drag-and-drop
+>
+> │ ├─ Terrain/ — Heightmap sculpt/paint, material splatting
+>
+> │ └─ UndoRedo/ — Command stack, invertible operations
+
+# 14. Phase 2.0 Preview
+
+With Phase 1.5 complete, ICUX Engine will support a fully playable, content-rich vertical slice. Phase 2.0 targets next-generation rendering, console platform support, live-service infrastructure, and advanced tooling. A full Phase 2.0 architecture document is published separately.
+
+| **System**                                     | **Target**                                  | **Phase 2.0 Document Section** |
+|------------------------------------------------|---------------------------------------------|--------------------------------|
+| Ray Tracing (RT reflections, RT GI, denoising) | Vulkan Ray Tracing extensions               | Sections 2–3                   |
+| Console Ports (PS5, Xbox Series X\|S)          | GNM/GNMX, D3D12 backends                    | Sections 4–5                   |
+| Virtual Geometry (Nanite-style mesh LOD)       | GPU-driven, cluster-based                   | Section 6                      |
+| Global Illumination (Lumen-style)              | Hybrid probe + screen-trace                 | Section 7                      |
+| Destruction System                             | Voronoi fracture, physics debris            | Section 8                      |
+| Visual Scripting                               | Node graph, compiled to native              | Section 9                      |
+| Modding Pipeline                               | Sandboxed mod loading                       | Section 10                     |
+| Live Service Infrastructure                    | Seasonal content, matchmaking, leaderboards | Section 11                     |
+| Cinematic Sequencer                            | Timeline editor, camera rails               | Section 12                     |
+| Cross-Play / Cross-Platform                    | Unified matchmaking, input fairness         | Section 13                     |
+
+*— End of Document —*
+
+ICUX Engine — Phase 1.5 Production Systems Architecture — v0.0.0.0
+
+**CONFIDENTIAL — Engineering Eyes Only**

@@ -1,0 +1,561 @@
+**CONFIDENTIAL**
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+# ICUX ENGINE
+
+Next-Gen and Platform Expansion Architecture
+
+Technical Design Document — Phase 2.0
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Version 0.0.0.0
+
+Classification: Internal — Engineering Eyes Only
+
+March 2026
+
+Prepared by: Engine Architecture Team
+
+Approved by: Technical Director / CTO
+
+# Revision History
+
+| **Version** | **Date**   | **Author**               | **Description**                         |
+|-------------|------------|--------------------------|-----------------------------------------|
+| 0.0.0.0     | 2026-03-20 | Engine Architecture Team | Initial Phase 2.0 architecture document |
+| 0.0.0.0     | 2026-03-15 | Principal Architect      | Internal review draft                   |
+
+# Table of Contents
+
+# 1. Executive Summary
+
+This document defines the Phase 2.0 architecture for ICUX Engine. Where Phase 1 established the core runtime and Phase 1.5 delivered production systems (animation, audio, UI, VFX, anti-cheat), Phase 2.0 targets the features that elevate ICUX Engine from a competitive AAA FPS engine to a next-generation, multi-platform franchise technology stack.
+
+Phase 2.0 covers three strategic pillars: next-generation rendering (ray tracing, virtual geometry, advanced global illumination), platform expansion (PlayStation 5, Xbox Series X\|S, cross-play), and live-service infrastructure (seasonal content, matchmaking, modding). These systems are what differentiate a franchise engine from a single-title codebase.
+
+All Phase 2.0 systems build on the proven Phase 1 and 1.5 infrastructure. The ECS, render graph, networking stack, job system, asset pipeline, and editor are assumed stable. Phase 2.0 is additive; no Phase 1/1.5 APIs are broken.
+
+## 1.1 Phase 2.0 Scope
+
+| **System**                                      | **Priority** | **Estimated Team** | **Estimated Duration** |
+|-------------------------------------------------|--------------|--------------------|------------------------|
+| Ray Tracing Pipeline                            | Critical     | 6 engineers        | 6 months               |
+| Console Platform Ports (PS5 / Xbox Series X\|S) | Critical     | 10 engineers       | 8 months               |
+| Virtual Geometry (Nanite-style)                 | High         | 5 engineers        | 8 months               |
+| Global Illumination (Lumen-style)               | High         | 5 engineers        | 6 months               |
+| Destruction System                              | High         | 4 engineers        | 5 months               |
+| Cross-Play and Cross-Platform                   | High         | 4 engineers        | 4 months               |
+| Live Service Infrastructure                     | Critical     | 8 engineers        | 6 months               |
+| Cinematic Sequencer                             | Medium       | 4 engineers        | 4 months               |
+| Visual Scripting                                | Medium       | 4 engineers        | 5 months               |
+| Modding Pipeline                                | Medium       | 3 engineers        | 4 months               |
+| AI/NPC System                                   | High         | 5 engineers        | 5 months               |
+| Procedural Generation Tools                     | Low          | 3 engineers        | 4 months               |
+
+## 1.2 Dependencies on Phase 1 and 1.5
+
+Phase 2.0 assumes the following are API-frozen and production-stable:
+
+- All Phase 1 systems (core, ECS, rendering, physics, networking, assets, serialisation, profiling)
+
+- All Phase 1.5 systems (animation, audio, UI/HUD, VFX, anti-cheat, replay, telemetry, localisation, editor)
+
+- The render graph abstraction and IRenderBackend interface are extended (not replaced) for ray tracing and new backends
+
+- The ECS is extended with new component types but the archetype storage model is unchanged
+
+# 2. Ray Tracing Pipeline
+
+Ray tracing brings physically accurate reflections, shadows, ambient occlusion, and global illumination to ICUX Engine. The implementation targets Vulkan Ray Tracing extensions (VK_KHR_ray_tracing_pipeline, VK_KHR_acceleration_structure) on desktop and PS5/Xbox native ray tracing APIs on console.
+
+## 2.1 Acceleration Structure Management
+
+Ray tracing requires a two-level acceleration structure (AS): a Bottom-Level AS (BLAS) per unique mesh and a Top-Level AS (TLAS) that references all BLAS instances in the scene. BLAS is built once per mesh at asset load time (static geometry) or rebuilt per frame for deformable meshes (skinned characters). TLAS is rebuilt every frame to reflect current entity positions. TLAS build is a GPU operation dispatched as an early compute pass in the render graph, before any ray tracing passes.
+
+## 2.2 RT Features
+
+| **Feature**            | **Method**                                                                            | **Quality Setting**                                              | **Performance Impact**  |
+|------------------------|---------------------------------------------------------------------------------------|------------------------------------------------------------------|-------------------------|
+| RT Reflections         | One bounce per pixel. Hybrid: screen-space trace first, ray trace for misses.         | Low: half-res, 0.5 rays/pixel. High: full-res, 1 ray/pixel.      | 1.5–3.0 ms GPU at 1080p |
+| RT Shadows             | Ray-traced shadow for the primary directional light. Soft shadows via penumbra angle. | Low: 1 ray/pixel. High: 4 rays/pixel with temporal accumulation. | 0.5–1.5 ms GPU          |
+| RT Ambient Occlusion   | Short-range rays from surface normal hemisphere.                                      | Low: 0.5 rays/pixel. High: 1 ray/pixel.                          | 0.5–1.0 ms GPU          |
+| RT Global Illumination | Multi-bounce diffuse GI via probe-based irradiance with ray-traced updates.           | Low: probe update every 4 frames. High: every frame.             | 2.0–4.0 ms GPU          |
+
+## 2.3 Denoising
+
+Raw ray-traced results at 0.5–1 ray per pixel are noisy. A temporal-spatial denoiser is applied to each RT output before compositing. The denoiser uses: per-pixel motion vectors (from the TAA pass) for temporal reprojection, edge-aware spatial filtering (guided by normal and depth buffers), and variance-based confidence weighting. The denoiser runs as a compute pass and costs approximately 0.5–1.0 ms GPU. The total RT budget including denoising is 4–8 ms depending on quality tier.
+
+## 2.4 Fallback Path
+
+RT features are strictly optional. When ray tracing hardware is unavailable (older GPUs, OpenGL backend), the engine falls back to rasterised equivalents: screen-space reflections (SSR), cascaded shadow maps (CSM), SSAO, and static light probes for GI. Quality settings allow players to enable individual RT features independently (e.g., RT reflections on, RT GI off).
+
+## 2.5 RT Memory Budget
+
+| **Resource**             | **Budget** | **Notes**                                   |
+|--------------------------|------------|---------------------------------------------|
+| BLAS (all scene meshes)  | 256 MB     | Compressed BLAS, static geometry dominant   |
+| TLAS                     | 16 MB      | Rebuilt per frame, instance references only |
+| RT output targets        | 64 MB      | Half-res reflection, shadow, AO, GI targets |
+| Denoiser history buffers | 32 MB      | Temporal reprojection state                 |
+| Total RT pipeline        | 368 MB     | Only allocated when RT is enabled           |
+
+# 3. Virtual Geometry System
+
+Virtual geometry (inspired by Unreal Engine 5’s Nanite) eliminates traditional mesh LOD management by streaming and rendering geometry at the triangle-cluster level. Artists author a single high-polygon source mesh; the engine automatically decomposes it into clusters, builds a hierarchical LOD DAG, and renders only the clusters that contribute to the final image at the target pixel density.
+
+## 3.1 Cluster Decomposition (Offline)
+
+Source meshes are processed by an offline tool that: partitions the mesh into clusters of 64–128 triangles each (grouping spatially coherent triangles); builds a hierarchical LOD DAG where each level merges and simplifies child clusters; computes per-cluster bounding spheres and screen-space error metrics; and packs cluster data into a streamable format with per-cluster granularity.
+
+## 3.2 GPU-Driven Rendering Pipeline
+
+At runtime, virtual geometry rendering is entirely GPU-driven. A compute pass traverses the cluster DAG top-down: for each cluster, it computes the projected screen-space error based on the cluster’s bounding sphere and the camera’s distance. If the error is below the threshold (roughly 1 pixel), the cluster is selected for rendering; otherwise, its children are traversed. Selected clusters are written to an indirect draw buffer. A single indirect draw call renders all selected clusters. There is no CPU per-cluster decision making.
+
+## 3.3 Cluster Streaming
+
+Only clusters that are needed for the current frame are resident in GPU memory. The streaming system maintains a priority queue of clusters ranked by projected screen-space size and camera proximity. High-priority clusters are streamed from disk to GPU memory via the asset streaming pipeline. Low-priority clusters are evicted when the virtual geometry memory budget is exceeded. A fallback coarse LOD is always resident to prevent visual holes during streaming.
+
+## 3.4 Integration with Existing Renderer
+
+Virtual geometry replaces the traditional mesh rendering path for static environment geometry. It integrates with the render graph as a new pass type (VirtualGeometryPass) that outputs to the same depth and colour targets as the standard forward pass. Skinned meshes (characters, animated objects) continue to use the traditional mesh pipeline, as cluster-based rendering of deformable geometry is a research problem beyond current scope.
+
+## 3.5 Performance and Memory
+
+| **Metric**                  | **Target**                | **Notes**                                                       |
+|-----------------------------|---------------------------|-----------------------------------------------------------------|
+| Triangle throughput         | 100M+ triangles per frame | GPU-driven, no CPU bottleneck                                   |
+| Cluster selection (compute) | \< 0.5 ms GPU             | DAG traversal + indirect buffer write                           |
+| GPU memory (clusters)       | 512 MB budget             | Streaming pool, LRU eviction                                    |
+| Disk format                 | ~50% of raw mesh size     | Cluster packing with quantised attributes                       |
+| Artist workflow impact      | None                      | Artists author high-poly source; pipeline handles decomposition |
+
+# 4. Global Illumination System
+
+The GI system provides dynamic, multi-bounce indirect lighting without pre-baked lightmaps. This enables fully dynamic time-of-day, destructible environments that affect lighting, and runtime-placed lights with correct indirect contribution. The approach is a hybrid probe-based system inspired by Lumen (UE5) and DDGI (NVIDIA).
+
+## 4.1 Irradiance Probes
+
+The world is populated with a 3D grid of irradiance probes (typical spacing: 2–4 metres). Each probe stores a low-resolution irradiance spherical harmonic (SH) representing incoming indirect light from all directions. Probes are updated by tracing a fixed number of rays (64–256 per probe per update) into the scene and accumulating hit radiance. Probe updates are amortised over multiple frames: a subset of probes are updated each frame on a round-robin schedule.
+
+## 4.2 Probe Placement and Streaming
+
+Probes are placed automatically on a regular grid during level build. Interior spaces (rooms, corridors) use denser probe spacing than open exteriors. The probe grid is chunked and streamed with level cells. When a cell is loaded, its probe grid is allocated and initialised by tracing rays for a warm-up period (2–4 frames). Probe data for unloaded cells is discarded.
+
+## 4.3 Screen-Space Radiance Feedback
+
+To capture short-range GI (colour bleeding from nearby surfaces), the system combines probe data with a screen-space radiance cache. The screen-space cache traces short rays (\< 2 metres) against the depth buffer and nearby geometry to capture contact-shadow-scale indirect lighting that probes miss due to their coarse spacing. The screen-space and probe contributions are blended at shading time based on confidence (screen-space is preferred when available; probes fill gaps).
+
+## 4.4 Emissive GI
+
+Emissive surfaces (neon signs, fire, muzzle flash) contribute to GI through the probe system. The ray tracer samples emissive materials during probe updates, propagating their light through the probe network over multiple frames. This provides physically plausible dynamic emissive lighting without placing explicit light sources.
+
+## 4.5 GI Quality Tiers
+
+| **Tier**   | **Probe Update**   | **Rays per Probe** | **Screen-Space Cache** | **GPU Cost**                  |
+|------------|--------------------|--------------------|------------------------|-------------------------------|
+| Off        | No GI              | —                  | No                     | 0 ms                          |
+| Low        | Every 4 frames     | 64                 | No                     | 1.0 ms                        |
+| Medium     | Every 2 frames     | 128                | Half-resolution        | 2.5 ms                        |
+| High       | Every frame        | 256                | Full-resolution        | 4.0 ms                        |
+| Ultra (RT) | Every frame via RT | 256 (hardware RT)  | Full-resolution        | 5.0 ms (requires RT hardware) |
+
+## 4.6 Memory Budget
+
+| **Resource**                   | **Budget** | **Notes**                      |
+|--------------------------------|------------|--------------------------------|
+| Probe grid SH data             | 64 MB      | Per-loaded-cell probe grids    |
+| Screen-space radiance cache    | 32 MB      | Half-res temporal history      |
+| Ray tracing scratch (if RT GI) | 32 MB      | Shared with RT pipeline budget |
+| Total GI system                | 128 MB     | Scales with quality tier       |
+
+# 5. Console Platform Ports
+
+ICUX Engine targets PlayStation 5 and Xbox Series X\|S as primary console platforms. Console ports require new rendering backends, platform-specific APIs, certification compliance, and performance optimisation for fixed hardware.
+
+## 5.1 Rendering Backends
+
+| **Platform**             | **Graphics API** | **Backend**            | **Notes**                                                                                                        |
+|--------------------------|------------------|------------------------|------------------------------------------------------------------------------------------------------------------|
+| PlayStation 5            | GNM / GNMX       | ICUX::Renderer::GNM    | Sony’s low-level API. Shader compilation via PlayStation SDK shader compiler (PSSL or SPIR-V cross-compilation). |
+| Xbox Series X\|S         | Direct3D 12      | ICUX::Renderer::D3D12  | Microsoft’s explicit API. HLSL shaders cross-compiled from SPIR-V via SPIRV-Cross → HLSL → DXIL.                 |
+| Windows (existing)       | Vulkan 1.3       | ICUX::Renderer::Vulkan | Primary desktop backend. No changes.                                                                             |
+| Windows/Linux (existing) | OpenGL 4.6       | ICUX::Renderer::OpenGL | Fallback desktop backend. No changes.                                                                            |
+
+## 5.2 Shader Cross-Compilation Pipeline
+
+Shaders are authored once in GLSL and compiled to SPIR-V (existing pipeline). For console targets, a cross-compilation stage converts SPIR-V to platform-native shaders: SPIRV-Cross generates HLSL for Xbox (compiled to DXIL via DXC), and SPIRV-Cross generates GLSL for PS5 (compiled to GNM shaders via the PlayStation shader compiler, or SPIR-V is consumed directly where supported). The cross-compilation step runs in the asset build pipeline, not at runtime. All shader permutations are pre-compiled per platform.
+
+## 5.3 Platform Abstraction Additions
+
+| **System**    | **PS5**                                                   | **Xbox Series X\|S**                          |
+|---------------|-----------------------------------------------------------|-----------------------------------------------|
+| Input         | DualSense haptics, adaptive triggers, touchpad, gyroscope | Xbox controller, impulse triggers             |
+| File I/O      | PS5 SSD Kraken decompression, custom read scheduler       | Xbox Velocity Architecture, DirectStorage API |
+| Audio         | Tempest 3D audio engine integration                       | Windows Sonic / Dolby Atmos integration       |
+| User accounts | PlayStation Network (PSN) API                             | Xbox Live / GDK user management               |
+| Achievements  | PSN Trophies API                                          | Xbox Achievements API                         |
+| Networking    | PSN matchmaking integration                               | Xbox Live multiplayer services                |
+| Save data     | PS5 Activities, save data API                             | Xbox Connected Storage                        |
+
+## 5.4 Performance Targets (Console)
+
+| **Metric**       | **PS5 / Xbox Series X**                            | **Xbox Series S**                        |
+|------------------|----------------------------------------------------|------------------------------------------|
+| Resolution       | 4K (dynamic, 80–100% scale)                        | 1440p (dynamic, 70–90% scale)            |
+| Frame rate       | 120 FPS (Performance) / 60 FPS (Quality)           | 120 FPS (Performance) / 60 FPS (Quality) |
+| Ray tracing      | RT reflections + RT shadows at 60 FPS Quality mode | RT shadows only at 60 FPS Quality mode   |
+| Virtual geometry | Full cluster streaming                             | Reduced cluster budget (256 MB)          |
+| Player count     | 64 players                                         | 64 players                               |
+| Load time (cold) | \< 8 seconds (SSD mandatory)                       | \< 10 seconds                            |
+
+## 5.5 Certification Requirements
+
+Console certification requires compliance with platform-specific technical requirements: memory budget limits (PS5: ~12 GB usable, Xbox Series X: ~13.5 GB usable), mandatory suspend/resume support, trophy/achievement integration, parental controls, network connectivity loss handling, and TRC/XR (Technical Requirements Checklist / Xbox Requirements) documentation. A dedicated compliance engineer tracks and validates all requirements per platform throughout development.
+
+# 6. Destruction System
+
+The destruction system enables real-time breakage of environmental objects: walls, cover, vehicles, props, and structures. Destruction is a core gameplay mechanic in a competitive FPS (shooting through walls, breaching, destroying cover) and a major visual fidelity differentiator.
+
+## 6.1 Fracture Pipeline (Offline)
+
+Destructible meshes are pre-fractured offline using Voronoi decomposition. The artist selects a mesh, defines fracture parameters (cell count: 8–128 fragments, seed distribution pattern, interior material), and the tool generates: fragment meshes with interior faces, per-fragment physics colliders (convex hulls), connection graph (which fragments are adjacent and the force threshold to break each connection), and a debris-LOD mesh for distant rendering.
+
+## 6.2 Runtime Destruction
+
+At runtime, destructible objects start as a single entity with a compound physics collider. When damage exceeds the connection threshold between two fragments, the connection is broken. Disconnected fragments are spawned as individual physics rigid bodies and simulate under gravity and collision. The connection graph supports partial destruction: a wall can have a hole punched through it while the surrounding structure remains intact. Fragment physics bodies are demoted to static (sleeping) after settling, and eventually replaced with a decal to free physics resources.
+
+## 6.3 Networked Destruction
+
+Destruction events are server-authoritative. The server evaluates damage against the connection graph and broadcasts destruction events (which fragments broke, impulse direction) to all clients. Clients spawn fragment bodies locally from the same pre-fractured data, ensuring visual consistency. Fragment physics simulation runs locally on each client (non-authoritative — debris is cosmetic). This approach keeps bandwidth minimal: a destruction event is approximately 50–100 bytes regardless of fragment count.
+
+## 6.4 Integration with Other Systems
+
+- **Rendering:** Fragments use the same PBR material as the source mesh plus an interior material for cut faces. Fragment meshes are registered as transient assets, culled and rendered through the standard pipeline.
+
+- **Physics:** Fragments are dynamic rigid bodies in Jolt. Sleeping policy: fragments sleep after 2 seconds of sub-threshold velocity. Sleeping fragments are batched into a static compound collider after 10 seconds.
+
+- **Audio:** Destruction events trigger material-specific impact sounds (concrete crumble, glass shatter, metal groan). Fragment collision sounds scale with impact velocity.
+
+- **VFX:** Dust, sparks, and debris particles are spawned at the destruction point. Effect intensity scales with destruction energy.
+
+- **Navigation:** Navmesh is updated incrementally to reflect destroyed/opened paths. Blocked paths are re-evaluated on destruction events.
+
+## 6.5 Performance Budget
+
+| **Metric**                                  | **Budget**                         | **Notes**                                            |
+|---------------------------------------------|------------------------------------|------------------------------------------------------|
+| Max simultaneous fragments (active physics) | 256                                | Beyond 256, oldest fragments are forced to sleep     |
+| Fragment spawn CPU cost                     | \< 0.3 ms per destruction event    | Pre-fractured data — no runtime fracture computation |
+| GPU cost (fragment rendering)               | Included in standard mesh budget   | Fragments are regular draw calls                     |
+| Memory per destructible object              | ~50 KB (fracture data + colliders) | Amortised across streaming cells                     |
+
+# 7. Cross-Play and Cross-Platform
+
+Cross-play allows players on PC (Windows, Linux), PlayStation 5, and Xbox Series X\|S to compete in the same matches. This requires unified matchmaking, input-fairness policies, identity management across platforms, and compliance with platform-specific cross-play requirements.
+
+## 7.1 Unified Identity and Friends
+
+Each player has an ICUX Account (platform-agnostic identity) linked to one or more platform accounts (Steam, PSN, Xbox Live, Epic). The ICUX Account is the matchmaking and progression authority. Platform accounts are authenticated via OAuth during login. Friends lists merge platform friends with ICUX friends for a unified social experience. Cross-platform invites route through the ICUX backend, triggering platform-native notification flows.
+
+## 7.2 Input Fairness
+
+Keyboard/mouse and controller players have inherently different aiming characteristics. ICUX Engine’s matchmaking supports input-based matchmaking: by default, controller players match with controller players and KB/M with KB/M. Mixed-input lobbies are opt-in. When a controller player is in a KB/M lobby, aim assist is disclosed to all players. Input type is reported by the client and validated server-side (input cadence analysis detects spoofed input types).
+
+## 7.3 Platform Certification for Cross-Play
+
+| **Platform** | **Cross-Play Requirements**                                                                                                                       |
+|--------------|---------------------------------------------------------------------------------------------------------------------------------------------------|
+| PlayStation  | Must support PS-only matchmaking option. PSN friends list integration. PS Plus requirement for online play. Sony approval for cross-play feature. |
+| Xbox         | Must support Xbox-only matchmaking option. Xbox Live friends integration. Game Pass compatibility. Xbox network play requirement.                 |
+| Steam        | Steam friends integration. No additional online subscription. VAC integration optional.                                                           |
+
+## 7.4 Determinism Across Platforms
+
+Cross-play does not require cross-platform determinism because ICUX Engine uses server-authoritative networking (established in Phase 1). The server runs the canonical simulation; clients on all platforms predict and reconcile. Minor floating-point differences across platforms are absorbed by the reconciliation system. This architectural decision (made in Phase 1) pays dividends here: cross-play requires no engine-level determinism changes.
+
+# 8. Live Service Infrastructure
+
+A modern AAA multiplayer FPS is a live service: it ships once and evolves over years with seasonal content, balance updates, events, and player engagement systems. ICUX Engine’s live-service infrastructure provides the backend integration and client systems to support this model.
+
+## 8.1 Seasonal Content Pipeline
+
+Content (maps, weapons, character skins, game modes) is delivered as downloadable content packs. Each season (typically 3–4 months) introduces a content pack that is downloaded via the platform’s content delivery system (Steam, PSN, Xbox CDN). Content packs are additive: they do not replace existing assets but add new entries to the asset registry. The client downloads the manifest, resolves new assets, and streams them on demand. No engine code changes are required for new content — all content is data-driven.
+
+## 8.2 Matchmaking
+
+Matchmaking is handled by a backend service that pairs players based on: skill rating (Elo/Glicko-2 or TrueSkill variant), input type preference, region (latency-based), party size, and playlist selection. The matchmaker runs server-side and communicates with game servers to allocate match instances. Match quality targets: \<60 seconds queue time, \<50 ms latency for 90% of players, skill spread within 1 standard deviation.
+
+## 8.3 Progression and Economy
+
+Player progression (XP, level, battle pass, challenges) and any in-game economy (cosmetic currency, item shop) are managed by backend microservices. The engine client communicates with these services via REST APIs over HTTPS. Progression state is server-authoritative: the client displays progress but cannot modify it. This prevents client-side progression exploits.
+
+## 8.4 Server Infrastructure
+
+| **Component**       | **Technology**                                           | **Notes**                                                |
+|---------------------|----------------------------------------------------------|----------------------------------------------------------|
+| Game servers        | Dedicated servers on bare-metal or cloud (AWS/GCP/Azure) | Autoscaling based on player demand. Regional deployment. |
+| Matchmaking service | Microservice (Go or Rust)                                | Stateless, horizontally scalable. Redis for queue state. |
+| Progression service | Microservice + PostgreSQL                                | Player state persistence. Event-driven updates.          |
+| Content delivery    | Platform CDN (Steam, PSN, Xbox)                          | Content packs distributed via platform update system.    |
+| Telemetry ingest    | Kafka → ClickHouse / BigQuery                            | High-throughput event stream processing.                 |
+| Anti-cheat backend  | Microservice + ML pipeline                               | Statistical analysis, manual review queue.               |
+| Identity service    | OAuth2 + JWT                                             | Cross-platform account linking and authentication.       |
+
+# 9. Cinematic Sequencer
+
+The cinematic sequencer is a timeline-based tool for authoring non-interactive sequences: intro cinematics, round-start fly-overs, post-match highlight reels, and trailer capture. It operates within the ICUX Editor as a specialised mode.
+
+## 9.1 Timeline Architecture
+
+The sequencer presents a multi-track timeline. Each track controls one aspect of the sequence: camera position/orientation (spline-based), entity animation (trigger specific clips or graph states), audio (trigger sound events or music stingers), VFX (spawn particle emitters at keyframed times), lighting (override light parameters over time), and post-processing (keyframe exposure, colour grading, DOF). Tracks are evaluated each frame during playback; the sequencer overrides normal gameplay control of affected entities.
+
+## 9.2 Camera System
+
+- **Camera Rail:** A Catmull-Rom spline defined by control points with per-point speed, FOV, and roll. The camera follows the rail with configurable easing.
+
+- **Look-At Tracking:** Camera orientation can be locked to track a specific entity (e.g., follow a player during a highlight reel) while the position follows the rail.
+
+- **Dolly / Crane:** Virtual dolly (lateral track) and crane (vertical arc) camera movements defined by parametric curves.
+
+- **Shake:** Procedural camera shake with configurable frequency, amplitude, and decay. Triggered by explosion events or manual keyframes.
+
+## 9.3 Rendering for Capture
+
+The sequencer supports offline rendering at arbitrary resolution and frame rate for trailer capture. In offline mode, the engine renders each frame to an EXR or PNG sequence at the target resolution (up to 8K) without real-time constraints. Frame stepping is deterministic: physics, animation, and VFX advance by a fixed delta per captured frame regardless of render time. Audio is rendered to a separate WAV file synchronised by frame number.
+
+## 9.4 Integration with Replay
+
+The sequencer can import replay files (.icuxrep) as a data source. This allows cinematic camera work to be applied to recorded match footage for highlight reels, tournament broadcasts, and promotional material. The replay provides entity positions and states; the sequencer adds camera work, post-processing, and audio.
+
+# 10. Visual Scripting
+
+Visual scripting provides a node-graph interface for gameplay logic, enabling designers to prototype and implement game mechanics without writing C++. It is not a replacement for C++ systems programming — it targets high-level gameplay logic: game mode rules, trigger sequences, objective flow, and interactive props.
+
+## 10.1 Node Graph Architecture
+
+The visual script is a directed graph of nodes. Each node is a typed operation: read component data, write component data, branch on condition, call engine API (spawn entity, play sound, apply damage), math operations, or timer/delay. Edges connect output pins to input pins, defining data and execution flow. Graphs are compiled to an intermediate bytecode representation at save time and interpreted by a lightweight VM at runtime.
+
+## 10.2 Node Categories
+
+| **Category** | **Examples**                                                   | **Notes**                                                         |
+|--------------|----------------------------------------------------------------|-------------------------------------------------------------------|
+| ECS Access   | Get/Set component field, query entities, create/destroy entity | Type-safe: node pins match component field types via ICUX_REFLECT |
+| Events       | OnMatchStart, OnPlayerKill, OnTriggerEnter, OnTimerExpire      | Subscribe to gameplay event bus from Phase 1.5                    |
+| Flow Control | Branch, ForEach, Sequence, Delay, Gate, DoOnce                 | Standard programming constructs in visual form                    |
+| Math         | Add, Multiply, Lerp, Clamp, Random, Vector ops                 | Scalar, vector, quaternion types                                  |
+| Engine API   | SpawnEntity, PlaySound, SpawnVFX, ApplyDamage, Teleport        | Wrapped engine APIs exposed as callable nodes                     |
+| UI           | ShowWidget, HideWidget, SetText, SetProgress                   | Drive HUD/menu state from script                                  |
+
+## 10.3 Compilation and Performance
+
+Visual scripts are compiled to a compact bytecode (ICUX Script Bytecode, .icuxsb) at editor save time. The bytecode is interpreted by a register-based VM. For shipping builds, an optional AOT (Ahead-of-Time) compiler translates bytecode to native C++ code, which is compiled and linked with the engine. This eliminates interpreter overhead in production. Target performance: interpreted VM executes 10,000 nodes per frame within 0.1 ms; AOT-compiled scripts run at native C++ speed.
+
+## 10.4 Debugging
+
+The visual script editor provides real-time debugging: breakpoints on nodes, step-through execution, pin value inspection, and execution flow highlighting (active path illuminated during play-in-editor). Errors (null entity, type mismatch, infinite loop detection) are caught by the VM and reported with the offending node highlighted in the graph.
+
+# 11. Modding Pipeline
+
+The modding pipeline allows the player community to create and share custom content: maps, game modes, weapons, skins, and gameplay mutations. Modding extends game lifetime, builds community, and provides a talent pipeline for studio recruitment. The system must be sandboxed to prevent mods from compromising security or stability.
+
+## 11.1 Mod Content Types
+
+| **Content Type** | **Format**                       | **Capabilities**                                    | **Restrictions**                                    |
+|------------------|----------------------------------|-----------------------------------------------------|-----------------------------------------------------|
+| Maps             | Level cells + asset pack         | Custom geometry, lighting, spawn points, objectives | No native code execution. Must pass validation.     |
+| Game Modes       | Visual script graphs             | Custom rules, scoring, win conditions, timers       | Sandboxed VM. No file system or network access.     |
+| Cosmetics        | Mesh + material + texture packs  | Player skins, weapon skins, sprays, emotes          | Must conform to skeleton and attachment point spec. |
+| Mutators         | Visual script + config overrides | Modify game parameters (gravity, speed, damage)     | Parameter ranges clamped. Cannot modify anti-cheat. |
+
+## 11.2 Mod SDK
+
+A public Mod SDK is distributed alongside the game. It includes: a standalone ICUX Editor build (without proprietary source code), asset import tools, visual scripting environment, map validator, and mod packaging tool. The SDK outputs mod packages (.icuxmod) which are self-contained archives containing all assets and scripts.
+
+## 11.3 Sandboxing and Security
+
+Mods are loaded in a sandboxed environment. Visual scripts execute in the restricted VM with no access to: the file system, network sockets, native function pointers, or engine internals beyond the published API. Asset loading for mods goes through a validation pass: mesh triangle counts are capped, texture resolutions are capped (4096×4096 max), and material shaders are restricted to the standard PBR shader with parameter overrides only (no custom shader code). Mods that fail validation are rejected at load time.
+
+## 11.4 Distribution
+
+Mods are distributed via platform-native workshop systems (Steam Workshop) and/or an ICUX-hosted mod portal. Players subscribe to mods; the game downloads and installs them automatically. Server operators can whitelist specific mods for their servers. Ranked/competitive playlists do not allow mods.
+
+# 12. AI and NPC System
+
+While ICUX Engine is primarily a multiplayer FPS engine, AI-controlled characters are required for: tutorial bots, practice range targets, co-op PvE modes, and single-player campaign (if scoped). The AI system provides navigation, perception, decision-making, and combat behaviour for non-player characters.
+
+## 12.1 Navigation
+
+- **Navmesh:** Pre-computed navigation mesh generated from static geometry in the editor. Supports walkable surfaces, jump links, drop-down links, and dynamic obstacle avoidance.
+
+- **Pathfinding:** A\* on the navmesh with string-pulling for smooth paths. Hierarchical pathfinding for long-distance queries (coarse graph of navmesh regions).
+
+- **Steering:** Local obstacle avoidance using velocity obstacles (ORCA). Smooth movement along paths with configurable acceleration and turn rates.
+
+- **Dynamic Updates:** Navmesh tiles affected by destruction events are re-baked at runtime (\< 5 ms per tile). New paths are available within 1–2 frames.
+
+## 12.2 Perception
+
+AI perception is driven by a sensory system: sight (frustum-shaped vision cone, line-of-sight raycast, peripheral awareness), hearing (sound events within audible radius, attenuated by distance and occlusion), and damage (instant awareness of damage source direction and type). Perception data is stored in a PerceptionComponent and updated each AI tick (16 Hz for standard bots, 32 Hz for combat-active bots).
+
+## 12.3 Behaviour Trees
+
+AI decision-making uses behaviour trees authored in the ICUX Editor. The tree evaluates top-down each AI tick: selector nodes choose between branches based on conditions (has target? low health? near objective?), sequence nodes execute a chain of actions, and leaf nodes execute concrete actions (move to position, aim at target, fire weapon, take cover, reload). Behaviour trees are data-driven assets; designers can create new AI archetypes without C++ code.
+
+## 12.4 Combat Behaviour
+
+| **Behaviour**    | **Description**                                                                                       | **Difficulty Scaling**                                              |
+|------------------|-------------------------------------------------------------------------------------------------------|---------------------------------------------------------------------|
+| Target selection | Prioritise nearest visible threat. Fallback: last known position.                                     | Higher difficulty: better prioritisation, faster switching.         |
+| Aiming           | Aim toward target with configurable accuracy (deviation angle) and reaction time.                     | Easy: 5° deviation, 400 ms react. Hard: 1° deviation, 100 ms react. |
+| Cover usage      | Evaluate nearby cover points (raycast to verify concealment). Move to cover when health \< threshold. | Higher difficulty: better cover selection, faster repositioning.    |
+| Flanking         | If target is stationary and in cover, attempt to approach from an unobserved angle.                   | Higher difficulty: longer flanking routes, coordinated team flanks. |
+| Grenade usage    | Throw grenade at clustered enemies or to flush from cover. Arc calculated via ballistic solver.       | Higher difficulty: better placement, predictive throws.             |
+
+# 13. Procedural Generation Tools
+
+Procedural generation tools support content creation at scale: terrain generation, prop scatter, building layout, and loot distribution. These tools run in the editor as authoring accelerators — they generate initial content that artists refine by hand. They are not runtime systems (no procedural levels during gameplay).
+
+## 13.1 Terrain Generation
+
+- **Heightmap:** Multi-octave Perlin/Simplex noise with erosion simulation (hydraulic and thermal). Configurable parameters: scale, amplitude, erosion iterations, sea level.
+
+- **Biome Painting:** Rule-based biome assignment: slope angle, altitude, moisture (painted or noise-driven). Each biome defines material layers, vegetation density, and prop types.
+
+- **Road and River Carving:** Spline-based tools that deform the heightmap and assign appropriate surface materials along the path.
+
+## 13.2 Prop Scatter
+
+A rule-based scatter system distributes props (rocks, trees, grass, debris) across the terrain. Rules define: density per biome, slope/altitude constraints, minimum spacing, random scale/rotation ranges, and exclusion zones (near roads, buildings, spawn points). Scatter results are baked to entity definitions and saved with the level cell. Artists can manually override or remove individual scatter instances.
+
+## 13.3 Building Layout
+
+A modular building system uses pre-authored room modules (hallway, stairwell, room variants) that snap together on a grid. The procedural tool generates building layouts from a grammar: building footprint → floor plan → room placement → doorway/window carving → prop population. Artists define the grammar rules and module library; the tool generates candidates that artists select and refine.
+
+# 14. Performance Targets (Phase 2.0)
+
+Phase 2.0 adds significant GPU cost (ray tracing, virtual geometry, GI) and new platforms with fixed hardware budgets. The following targets account for all Phase 1 + 1.5 + 2.0 systems running simultaneously.
+
+| **Metric**            | **PC (High)**       | **PC (Ultra + RT)**        | **PS5 / Xbox Series X**             | **Xbox Series S**                 |
+|-----------------------|---------------------|----------------------------|-------------------------------------|-----------------------------------|
+| Resolution            | Native 1440p        | Dynamic 4K (70–100%)       | Dynamic 4K (80–100%)                | Dynamic 1440p (70–90%)            |
+| Frame rate            | 120 FPS             | 60 FPS                     | 60 FPS (Quality) / 120 FPS (Perf)   | 60 FPS (Quality) / 120 FPS (Perf) |
+| RT features           | None                | Reflections + Shadows + GI | Reflections + Shadows               | Shadows only                      |
+| Virtual geometry      | Yes                 | Yes                        | Yes                                 | Yes (reduced budget)              |
+| Global illumination   | Probe-based (no RT) | RT GI                      | Probe-based                         | Probe-based (low)                 |
+| Destruction fragments | 256 max             | 256 max                    | 192 max                             | 128 max                           |
+| Player count          | 64                  | 64                         | 64                                  | 64                                |
+| Total GPU budget      | 8.33 ms             | 16.67 ms                   | 16.67 ms (Quality) / 8.33 ms (Perf) | 16.67 ms / 8.33 ms                |
+| Total memory          | ~4 GB engine        | ~5 GB engine + RT          | ~10 GB total (of 12 GB usable)      | ~7 GB total (of 8 GB usable)      |
+
+# 15. Phase 2.0 Folder Structure Additions
+
+> ICUXEngine/
+>
+> ├─ Source/
+>
+> │ ├─ Renderer/
+>
+> │ │ ├─ RayTracing/ — AS management, RT pass definitions, denoiser
+>
+> │ │ ├─ VirtualGeometry/ — Cluster DAG traversal, GPU selection, streaming
+>
+> │ │ ├─ GlobalIllumination/ — Irradiance probes, screen-space cache, SH math
+>
+> │ │ ├─ D3D12/ — Direct3D 12 backend (Xbox / Windows fallback)
+>
+> │ │ └─ GNM/ — PlayStation 5 GNM/GNMX backend
+>
+> │ ├─ Destruction/
+>
+> │ │ ├─ Fracture/ — Runtime fracture evaluation, connection graph
+>
+> │ │ ├─ Debris/ — Fragment lifecycle, sleep policy, batching
+>
+> │ │ └─ Networking/ — Destruction event replication
+>
+> │ ├─ AI/
+>
+> │ │ ├─ Navigation/ — Navmesh, A\* pathfinding, ORCA steering
+>
+> │ │ ├─ Perception/ — Vision, hearing, damage awareness
+>
+> │ │ ├─ BehaviourTree/ — Tree evaluation, node types, editor integration
+>
+> │ │ └─ Combat/ — Aiming, cover evaluation, tactical decisions
+>
+> │ ├─ CrossPlay/
+>
+> │ │ ├─ Identity/ — ICUX Account, platform linking, OAuth
+>
+> │ │ ├─ Matchmaking/ — Input-based matchmaking, skill rating integration
+>
+> │ │ └─ Friends/ — Unified friends list, cross-platform invites
+>
+> │ ├─ LiveService/
+>
+> │ │ ├─ ContentPacks/ — Seasonal DLC manifest, asset registry extension
+>
+> │ │ ├─ Progression/ — XP, battle pass, challenges (backend client)
+>
+> │ │ └─ Economy/ — Item shop, currency (backend client)
+>
+> │ ├─ Cinematic/
+>
+> │ │ ├─ Sequencer/ — Timeline engine, track evaluation, keyframes
+>
+> │ │ ├─ Camera/ — Rail system, dolly/crane, look-at tracking
+>
+> │ │ └─ OfflineRender/ — Frame stepping, EXR/PNG export, audio render
+>
+> │ ├─ Scripting/
+>
+> │ │ ├─ Graph/ — Node definitions, edge validation, graph compiler
+>
+> │ │ ├─ VM/ — Bytecode interpreter, register VM, sandbox
+>
+> │ │ └─ AOT/ — Bytecode → C++ transpiler for shipping builds
+>
+> │ ├─ Modding/
+>
+> │ │ ├─ SDK/ — Public mod SDK packaging and distribution
+>
+> │ │ ├─ Loader/ — .icuxmod archive loading, validation, sandboxing
+>
+> │ │ └─ Workshop/ — Steam Workshop / ICUX portal integration
+>
+> │ └─ ProceduralGen/
+>
+> │ ├─ Terrain/ — Noise generation, erosion, biome rules
+>
+> │ ├─ Scatter/ — Rule-based prop distribution
+>
+> │ └─ Buildings/ — Modular grammar, room snapping, layout solver
+>
+> ├─ Platform/
+>
+> │ ├─ PS5/ — DualSense, Tempest audio, SSD, PSN APIs
+>
+> │ ├─ Xbox/ — GDK, DirectStorage, Xbox Live APIs
+>
+> │ └─ ... (existing Win/Linux)
+
+# 16. Phase 3.0 Horizon
+
+Beyond Phase 2.0, the following technologies are on the long-term research horizon. These are not committed deliverables but areas of active investigation.
+
+| **Technology**                   | **Description**                                                                                  | **Status**                                                               |
+|----------------------------------|--------------------------------------------------------------------------------------------------|--------------------------------------------------------------------------|
+| Neural rendering (DLSS/FSR/XeSS) | AI-based super-resolution upscaling replacing TAA for higher quality at lower native resolution. | Evaluation. DLSS 4 and FSR 4 SDKs under NDA review.                      |
+| Cloud streaming                  | Server-side rendering with client-side decode for low-spec devices and mobile.                   | Research. Latency and cost-of-compute analysis in progress.              |
+| Machine learning NPCs            | Neural-network-driven NPC behaviour for more organic and unpredictable AI.                       | Research. Inference cost vs behaviour quality tradeoff under evaluation. |
+| Volumetric rendering             | Real-time volumetric clouds, fog, and smoke with physically-based light scattering.              | Prototyping. GPU cost viable at 60 FPS; 120 FPS requires optimisation.   |
+| Mesh shaders                     | Next-gen GPU pipeline replacing vertex/geometry shaders for virtual geometry.                    | Ready for integration when minimum GPU spec allows (Turing+ / RDNA2+).   |
+| World partitioning at scale      | Seamless open worlds \>10 km² with persistent state and 200+ player support.                     | Long-term. Requires server mesh architecture beyond single-server model. |
+
+*— End of Document —*
+
+ICUX Engine — Phase 2.0 Next-Gen Architecture — v0.0.0.0
+
+**CONFIDENTIAL — Engineering Eyes Only**

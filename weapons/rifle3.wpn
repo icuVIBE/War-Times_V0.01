@@ -1,0 +1,39 @@
+# War Times Weapon Preset
+# Rifle3
+
+fire_rate = 0.11
+damage = 26
+range = 185
+max_ammo = 30
+reserve_ammo = 90
+reload_time = 2.1
+recoil_pitch = 1.6
+recoil_yaw = 0.35
+recoil_recovery = 6.5
+spread = 0.45
+ads_spread_mult = 0.28
+pellets_per_shot = 1
+automatic = 1
+
+gun_model = Gun/Rifle3
+gun_texture = Guns/Rifle3
+model_scale = 1
+model_offset = -0.13 -0.06 -0.14
+model_rotation = 3 3 0
+arm_offset = -0.14 0.08 -0.18
+barrel_length = 0.6
+laser_offset = 0 0 0
+
+right_grip = 0 -0.04 -0.04
+right_grip_rot = 0 0 0
+left_grip = 0 -0.02 0.18
+left_grip_rot = 0 0 0
+elbow_pole = 0 -0.3 0
+
+flash_duration = 0.045
+flash_offset = 0.065 0.125 0
+flash_layer_count = 4
+flash_layer_0 = 0.025 0.025 0.03 0 0 0 0 1 1 0.95 1.2 0.3
+flash_layer_1 = 0.015 0.015 0.08 0.03 0 0 0 1 0.85 0.3 1 0.6
+flash_layer_2 = 0.04 0.012 0.015 0 0 0 0 1 0.7 0.2 1.5 0.4
+flash_layer_3 = 0.012 0.04 0.015 0 0 0 0 1 0.7 0.2 1.5 0.4

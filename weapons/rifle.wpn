@@ -1,0 +1,39 @@
+# War Times Weapon Preset
+# Rifle
+
+fire_rate = 0.12
+damage = 25
+range = 200
+max_ammo = 30
+reserve_ammo = 90
+reload_time = 2
+recoil_pitch = 1.5
+recoil_yaw = 0.3
+recoil_recovery = 6
+spread = 0.5
+ads_spread_mult = 0.3
+pellets_per_shot = 1
+automatic = 1
+
+gun_model = Gun/AssaultRifle1
+gun_texture = Guns/Sg553
+model_scale = 0.95
+model_offset = -0.13 0.06 -0.15
+model_rotation = 3 6 0
+arm_offset = -0.15 0.09 -0.19
+barrel_length = 0.625
+laser_offset = 0.105 -0.07 -0.175
+
+right_grip = 0 -0.04 -0.04
+right_grip_rot = 0 0 0
+left_grip = 0 -0.02 0.18
+left_grip_rot = 0 0 0
+elbow_pole = 0 -0.3 0
+
+flash_duration = 0.045
+flash_offset = 0.11 -0.025 0
+flash_layer_count = 4
+flash_layer_0 = 0.025 0.025 0.03 0 0 0 0 1 1 0.95 1.2 0.3
+flash_layer_1 = 0.015 0.015 0.08 0.03 0 0 0 1 0.85 0.3 1 0.6
+flash_layer_2 = 0.04 0.012 0.015 0 0 0 0 1 0.7 0.2 1.5 0.4
+flash_layer_3 = 0.012 0.04 0.015 0 0 0 0 1 0.7 0.2 1.5 0.4
